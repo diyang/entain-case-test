@@ -1,0 +1,6 @@
+.venv
+uv.lock
+.coverage
+htmlcov/
+*.egg-info/
+__pycache__

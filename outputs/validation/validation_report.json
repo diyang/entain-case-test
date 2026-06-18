@@ -1,0 +1,22 @@
+{
+  "extra_columns": [],
+  "failure_counts_by_rule": {
+    "betting_amount_gt_0": 835,
+    "payout_formula": 3,
+    "price_gt_1": 5,
+    "return_for_entain_formula": 29
+  },
+  "generated_at": "2026-06-18T11:07:22+00:00",
+  "input_fingerprint": {
+    "path": "data/bets.csv",
+    "sha256": "5bf81e073584c2306d4be579d42ff287e9cdaa7de5728b3b27191d588b004c3f",
+    "size_bytes": 42200417
+  },
+  "input_path": "data/bets.csv",
+  "invalid_rows": 864,
+  "missing_columns": [],
+  "run_id": "tolerance-1e-5-check",
+  "schema_version": "bets-v1",
+  "total_rows": 372296,
+  "valid_rows": 371432
+}

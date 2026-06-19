@@ -9,6 +9,7 @@ from bet_pipeline.batch import (
     BetValidationBatchProcess,
     RunArtifactPublisher,
     ValidationBatchSettings,
+    ValidationCheckpointLoader,
 )
 from bet_pipeline.io import read_parquet, write_csv
 from bet_pipeline.schema import EXPECTED_COLUMNS
@@ -127,6 +128,65 @@ class BatchWorkflowTests(unittest.TestCase):
             self.assertTrue((run_dir / "validation" / "invalid_bets" / "part-00000.parquet").exists())
             self.assertTrue((run_dir / "features" / "customer_features" / "part-00000.parquet").exists())
             self.assertFalse((output_dir / "_staging" / "platform-test-run").exists())
+
+    def test_feature_batch_can_reuse_committed_validation_checkpoint(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_path = tmp_path / "bets.csv"
+            output_dir = tmp_path / "outputs"
+            write_csv(input_path, [_row("1", "1"), _row("2", "2", amount="-1")], EXPECTED_COLUMNS)
+
+            validation_run = RunArtifactPublisher(output_dir, run_id="001")
+            partitioned_input = BetValidationBatchProcess().process(
+                input_path,
+                validation_run.validation_dir,
+                ValidationBatchSettings(
+                    feature_partition_count=2,
+                    generated_at=validation_run.validation_generated_at,
+                ),
+            )
+            validation_report = validation_run.write_validation_report(partitioned_input)
+            validation_run.write_manifest(partitioned_input, validation_report)
+            validation_run.commit(partitioned_input)
+
+            checkpoint = ValidationCheckpointLoader(output_dir / "runs" / "001").load()
+            feature_run = RunArtifactPublisher(output_dir, run_id="001-features")
+            feature_result = BetFeatureBatchProcess().process(
+                checkpoint.partitioned_input,
+                feature_run.features_dir,
+                feature_run.feature_generated_at,
+            )
+            feature_run.write_feature_report(
+                checkpoint.partitioned_input,
+                checkpoint.validation_report,
+                feature_result,
+            )
+            manifest = feature_run.write_manifest(
+                checkpoint.partitioned_input,
+                checkpoint.validation_report,
+                feature_result,
+            )
+            feature_run.commit(checkpoint.partitioned_input)
+
+            validation_run_dir = output_dir / "runs" / "001"
+            feature_run_dir = output_dir / "runs" / "001-features"
+            self.assertEqual(manifest["source_validation_run_id"], "001")
+            self.assertTrue(manifest["reused_validation_checkpoint"])
+            self.assertEqual(manifest["outputs"]["validation_dir"], str(validation_run_dir / "validation"))
+            self.assertTrue((validation_run_dir / "_SUCCESS").exists())
+            self.assertTrue((feature_run_dir / "_SUCCESS").exists())
+            self.assertTrue((feature_run_dir / "features" / "customer_features" / "part-00000.parquet").exists())
+            self.assertFalse((feature_run_dir / "validation").exists())
+
+    def test_validation_checkpoint_requires_success_marker(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            validation_run_dir = tmp_path / "outputs" / "runs" / "001"
+            (validation_run_dir / "validation" / "valid_bets").mkdir(parents=True)
+            (validation_run_dir / "validation" / "invalid_bets").mkdir(parents=True)
+
+            with self.assertRaises(FileNotFoundError):
+                ValidationCheckpointLoader(validation_run_dir).load()
 
     def test_customer_hash_partitions_keep_customer_feature_complete(self) -> None:
         customer_b = "00000000-0000-4000-8000-000000000002"

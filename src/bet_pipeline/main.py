@@ -12,6 +12,7 @@ from bet_pipeline.batch import (
     BetValidationBatchProcess,
     RunArtifactPublisher,
     ValidationBatchSettings,
+    ValidationCheckpointLoader,
 )
 
 
@@ -37,6 +38,8 @@ class RunSummaryPrinter:
         self._write(f"  run_id: {manifest.get('run_id', 'unknown')}")
         self._write(f"  status: {manifest.get('status', 'unknown')}")
         self._write(f"  input: {manifest.get('input_path', 'unknown')}")
+        if manifest.get("reused_validation_checkpoint"):
+            self._write(f"  source_validation_run_id: {manifest.get('source_validation_run_id', 'unknown')}")
         self._write(f"  started_at: {manifest.get('started_at', 'unknown')}")
         self._write(f"  finished_at: {manifest.get('finished_at', 'unknown')}")
 
@@ -109,7 +112,6 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     batch_source_parser = argparse.ArgumentParser(add_help=False)
-    batch_source_parser.add_argument("--input", required=True, help="Path to input bets CSV")
     batch_source_parser.add_argument(
         "--output",
         required=True,
@@ -146,12 +148,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    subparsers.add_parser("validate", parents=[batch_source_parser], help="Validate raw betting records")
+    validate_parser = subparsers.add_parser(
+        "validate", parents=[batch_source_parser], help="Validate raw betting records"
+    )
+    validate_parser.add_argument("--input", required=True, help="Path to input bets CSV")
 
     features_parser = subparsers.add_parser(
         "build-features",
         parents=[batch_source_parser],
         help="Validate raw bets and build customer features",
+    )
+    features_parser.add_argument(
+        "--input", help="Path to input bets CSV. Required unless --from-validation-run is used."
+    )
+    features_parser.add_argument(
+        "--from-validation-run",
+        help="Committed validation run directory to reuse, for example /outputs/runs/001.",
     )
     features_parser.add_argument(
         "--first-n-bets",
@@ -179,24 +191,34 @@ def batch_output_root(command: str, output_dir: str) -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
     if args.command in {"validate", "build-features"}:
         artifact_publisher = RunArtifactPublisher(batch_output_root(args.command, args.output), args.run_id)
         try:
-            validation_batch_process = BetValidationBatchProcess()
-            partitioned_input = validation_batch_process.process(
-                args.input,
-                artifact_publisher.validation_dir,
-                ValidationBatchSettings(
-                    batch_size=args.batch_size,
-                    validation_worker_count=args.validation_workers,
-                    feature_partition_count=args.feature_partition_count,
-                    target_feature_partition_rows=args.target_feature_partition_rows,
-                    generated_at=artifact_publisher.validation_generated_at,
-                ),
-            )
-            report = artifact_publisher.write_validation_report(partitioned_input)
+            if args.command == "build-features" and args.from_validation_run is not None:
+                if args.input is not None:
+                    parser.error("build-features accepts either --input or --from-validation-run, not both")
+                checkpoint = ValidationCheckpointLoader(args.from_validation_run).load()
+                partitioned_input = checkpoint.partitioned_input
+                report = checkpoint.validation_report
+            else:
+                if args.command == "build-features" and args.input is None:
+                    parser.error("build-features requires either --input or --from-validation-run")
+                validation_batch_process = BetValidationBatchProcess()
+                partitioned_input = validation_batch_process.process(
+                    args.input,
+                    artifact_publisher.validation_dir,
+                    ValidationBatchSettings(
+                        batch_size=args.batch_size,
+                        validation_worker_count=args.validation_workers,
+                        feature_partition_count=args.feature_partition_count,
+                        target_feature_partition_rows=args.target_feature_partition_rows,
+                        generated_at=artifact_publisher.validation_generated_at,
+                    ),
+                )
+                report = artifact_publisher.write_validation_report(partitioned_input)
 
             if args.command == "validate":
                 manifest = artifact_publisher.write_manifest(partitioned_input, report)

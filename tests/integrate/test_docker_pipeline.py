@@ -82,6 +82,28 @@ class TestDockerPipelineIntegration:
         self._assert_customer_one_features(features_by_customer["00000000-0000-4000-8000-000000000001"])
         self._assert_customer_two_features(features_by_customer["00000000-0000-4000-8000-000000000002"])
 
+        validation_run_id = f"{run_id}-validation"
+        checkpoint_feature_run_id = f"{run_id}-features-from-checkpoint"
+        self._run(self._docker_validate_command(fixture_dir, output_dir, image_name, validation_run_id), cwd=repo_root)
+        self._run(
+            self._docker_build_features_from_validation_command(
+                output_dir,
+                image_name,
+                validation_run_id,
+                checkpoint_feature_run_id,
+            ),
+            cwd=repo_root,
+        )
+        checkpoint_feature_run_dir = output_dir / "runs" / checkpoint_feature_run_id
+        checkpoint_manifest = self._read_json(checkpoint_feature_run_dir / "run_manifest.json")
+        checkpoint_feature_report = self._read_json(checkpoint_feature_run_dir / "features" / "feature_report.json")
+
+        assert checkpoint_manifest["reused_validation_checkpoint"] is True
+        assert checkpoint_manifest["source_validation_run_id"] == validation_run_id
+        assert checkpoint_feature_report["source_validation_run_id"] == validation_run_id
+        assert not (checkpoint_feature_run_dir / "validation").exists()
+        assert (checkpoint_feature_run_dir / "_SUCCESS").is_file()
+
         failed_run_id = f"{run_id}-failed"
         failed_command = self._docker_build_features_command(fixture_dir, output_dir, image_name, failed_run_id)
         failed_command[failed_command.index("--batch-size") + 1] = "0"
@@ -123,6 +145,56 @@ class TestDockerPipelineIntegration:
             os.environ.get("TARGET_FEATURE_PARTITION_ROWS", "3"),
             "--validation-workers",
             os.environ.get("VALIDATION_WORKERS", "1"),
+            "--feature-workers",
+            os.environ.get("FEATURE_WORKERS", "1"),
+            "--first-n-bets",
+            os.environ.get("FIRST_N_BETS", "2"),
+        ]
+
+    def _docker_validate_command(self, fixture_dir: Path, output_dir: Path, image_name: str, run_id: str) -> list[str]:
+        return [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{fixture_dir}:/data:ro",
+            "-v",
+            f"{output_dir}:/outputs",
+            image_name,
+            "validate",
+            "--input",
+            "/data/bets.csv",
+            "--output",
+            "/outputs/validation",
+            "--run-id",
+            run_id,
+            "--batch-size",
+            os.environ.get("BATCH_SIZE", "2"),
+            "--target-feature-partition-rows",
+            os.environ.get("TARGET_FEATURE_PARTITION_ROWS", "3"),
+        ]
+
+    def _docker_build_features_from_validation_command(
+        self,
+        output_dir: Path,
+        image_name: str,
+        validation_run_id: str,
+        feature_run_id: str,
+    ) -> list[str]:
+        return [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{output_dir}:/outputs",
+            image_name,
+            "build-features",
+            "--from-validation-run",
+            f"/outputs/runs/{validation_run_id}",
+            "--output",
+            "/outputs/features",
+            "--run-id",
+            feature_run_id,
             "--feature-workers",
             os.environ.get("FEATURE_WORKERS", "1"),
             "--first-n-bets",

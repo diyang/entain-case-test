@@ -1,61 +1,35 @@
 # Design Note
 
-## Summary
+## Purpose
 
-This pipeline builds a production-style batch dataset for downstream ML consumers from raw betting records. The public `validate` command writes committed validation artifacts only. The public `build-features` command validates first, then optionally enters feature engineering to build customer-level features from the validated partitions.
+This package builds a production-style batch pipeline for downstream machine-learning consumers of betting data. It validates raw betting records, quarantines invalid rows, writes a curated validated-bets layer, and builds customer-level features from each customer's first N valid bets by authoritative `bet_num`.
 
-The important design choice is separating validation row batches from feature batches:
+The architecture diagram is kept in [architecture.md](architecture.md). This note explains the responsibilities, contracts, and operating behavior behind that diagram.
 
-- **Validation row batch:** `--batch-size` raw CSV rows read and validated at a time.
-- **Feature batch:** one customer-complete `valid_bets/part-*.parquet` file.
+## Public Workflows
 
-This avoids loading the full raw CSV into memory while preserving customer completeness for first-N feature generation.
+The CLI supports three production workflows:
 
-## Architecture Diagram
+| Workflow | Command shape | What it does |
+| --- | --- | --- |
+| Validation only | `bet-pipeline validate --input data/bets.csv --output outputs --run-id 001` | Reads the raw CSV in row batches, validates rows, writes valid and invalid parquet partitions, and commits a validation run. |
+| Validate and build features | `bet-pipeline build-features --input data/bets.csv --output outputs --run-id 001` | Runs validation first, then builds customer features from the newly created valid-bets partitions. |
+| Build from validation checkpoint | `bet-pipeline build-features --from-validation-run outputs/runs/001 --output outputs --run-id 001-features` | Reuses a committed validation run, skips raw CSV validation, and writes a new immutable feature run. |
 
-```mermaid
-flowchart TD
-    raw["Raw betting data<br/>landing area"]
-    scheduler["Scheduler / job trigger"]
+The checkpoint path is important for large inputs. If validation has already succeeded, feature generation should not reread the raw CSV, rerun validation, or rewrite `valid_bets` and `invalid_bets`.
 
-    subgraph validation["Validation batch process"]
-        direction TD
-        scan["CSV row-batch reader<br/>read --batch-size rows"]
-        row_worker["Concurrency-compatible row-batch workers<br/>validate rows<br/>schema + business rules"]
-        router["Customer-complete partition routing<br/>customer_id -> partition<br/>ordered parquet writes"]
-        valid["Curated validated-bets batches<br/>customer-complete partitions<br/>valid_bets/part-*.parquet"]
-        invalid["Invalid-record quarantine<br/>invalid_bets/part-*.parquet"]
+A typical checkpoint reuse sequence is:
 
-        scan --> row_worker --> router
-        router --> valid
-        router --> invalid
-    end
+```bash
+bet-pipeline validate \
+  --input data/bets.csv \
+  --output outputs \
+  --run-id 001
 
-    subgraph feature_engineering["Optional Feature Engineering partition based batch process"]
-        direction TD
-        feature_worker["Customer feature generation<br/>concurrency-compatible partition-based batch workers"]
-        feature_output["Versioned customer features<br/>customer_features/part-*.parquet"]
-
-        feature_worker --> feature_output
-    end
-
-    publish["ACID-style publish<br/>_staging -> runs + _SUCCESS"]
-    run["Committed run<br/>outputs/runs/run_id"]
-
-    raw --> scheduler --> scan
-    valid --> publish
-    invalid --> publish
-    valid -- "build-features only" --> feature_worker
-    feature_output -- "build-features only" --> publish
-    publish --> run
-
-    review["Operator review<br/>source correction"]
-    rerun["Rerun or backfill"]
-    invalid --> review --> rerun --> scheduler
-
-    run -- "feature run" --> training[Batch model training]
-    run -- "feature run" --> scoring[Batch scoring]
-    run -- "feature run" --> analytics[BI, CRM,<br/>or decisioning]
+bet-pipeline build-features \
+  --from-validation-run outputs/runs/001 \
+  --output outputs \
+  --run-id 001-features
 ```
 
 ## Components
@@ -63,69 +37,42 @@ flowchart TD
 | Component | Responsibility | Data in | Data out |
 | --- | --- | --- | --- |
 | Raw betting landing area | Holds the immutable source extract for a run. | Raw CSV such as `data/bets.csv` | CSV rows for validation |
-| Scheduler / job trigger | Starts either `validate` or `build-features` with input, output, run id, and sizing arguments. | Schedule, manual request, rerun, or backfill request | CLI invocation |
-| Validation batch process | Owns the validation stage over a bounded source file. | Raw CSV file | Curated valid-bets and invalid-record partitions |
-| CSV row-batch reader | Reads the bounded source file in `--batch-size` row batches without loading the whole file into memory. | Raw CSV file | Row batches |
-| Concurrency-compatible row-batch workers | Validate row batches against schema and business rules. Local execution defaults to one worker, but the design can run multiple workers. | One row batch per worker | Valid rows, invalid rows, validation metrics |
-| Customer-complete partition routing | Assigns rows to customer-complete partitions and coordinates ordered parquet writes. | Valid and invalid validation results | Partitioned valid and invalid parquet rows |
-| Curated validated-bets batches | Trusted handoff from validation to feature engineering. | Valid rows | `validation/valid_bets/part-*.parquet` |
-| Invalid-record quarantine | Stores rejected rows for investigation and correction. | Invalid rows plus validation errors | `validation/invalid_bets/part-*.parquet` |
-| Optional Feature Engineering partition based batch process | Runs only for `build-features`; owns customer feature generation from valid-bets partitions. | `validation/valid_bets/part-*.parquet` | Customer feature partitions |
-| Customer feature generation | Runs partition-based batch workers over customer-complete valid-bets parts. Local execution defaults to one worker, but the design can run multiple workers. | One valid-bets partition per worker | Feature rows |
-| Versioned customer features | ML-facing customer-level feature dataset. | Feature rows | `features/customer_features/part-*.parquet` |
-| ACID-style publish | Checks required artifacts, writes `_SUCCESS`, and publishes the staged run. | Staged validation and optional feature artifacts | Committed run directory |
-| Committed run | Stable output location that downstream systems can safely read. | Published artifacts | `outputs/runs/<run_id>/` |
-| Operator review / source correction | Investigates quarantined rows and coordinates upstream fixes. | Invalid-record quarantine | Corrected source data or review outcome |
-| Rerun or backfill | Reprocesses corrected or historical source snapshots through the same workflow. | Correction or backfill request | New committed run |
-| Batch model training | Consumes committed feature runs for offline model training. | `customer_features/part-*.parquet` | Training dataset |
-| Batch scoring | Consumes committed feature runs for offline scoring. | `customer_features/part-*.parquet` | Scored customers |
-| BI / CRM / decisioning | Consumes committed feature runs for analytics or activation. | `customer_features/part-*.parquet` | Analytical, CRM, or operational outputs |
+| Scheduler or job trigger | Starts `validate` or `build-features` with input paths, run id, and sizing parameters. | Schedule, manual request, rerun, or backfill request | CLI invocation |
+| `BetValidationBatchProcess` | Orchestrates validation over raw CSV row batches. | Raw CSV path and `ValidationBatchSettings` | `PartitionedInput` metadata plus valid/invalid parquet parts |
+| `BetValidationRowBatchWorker` | Validates one raw row batch. | Up to `--batch-size` CSV rows | Valid rows, invalid rows, validation failure counts |
+| Customer-complete partition routing | Keeps every `customer_id` in one feature partition while validation streams through row batches. | Valid and invalid row-batch outputs | `valid_bets/part-*.parquet` and `invalid_bets/part-*.parquet` |
+| Invalid-record quarantine | Preserves rejected rows for review. | Invalid rows plus validation errors | `validation/invalid_bets/part-*.parquet` |
+| `ValidationCheckpointLoader` | Loads a committed validation run for feature generation. | `outputs/runs/<validation_run_id>` | Existing valid-bets partitions and validation report |
+| `BetFeatureBatchProcess` | Orchestrates feature engineering over valid-bets partitions. | Customer-complete `valid_bets/part-*.parquet` files | Feature count and first-N completeness metrics |
+| `BetFeaturePartitionWorker` | Builds features for one customer-complete valid-bets partition. | One valid-bets parquet part | Matching `customer_features/part-*.parquet` |
+| `RunArtifactPublisher` | Owns staging, manifest/report writes, completeness checks, and publish. | Staged validation and/or feature artifacts | Committed `outputs/runs/<run_id>` with `_SUCCESS` |
+| Downstream consumers | Read committed feature runs. | `customer_features/part-*.parquet` plus reports/manifest | Training data, scoring input, BI/CRM/decisioning data |
 
-## Data Flow
+## Batch Model
 
-`bet_pipeline.main` receives either `validate` or `build-features`. Both commands run validation and commit validation artifacts. Only `build-features` enters the optional feature engineering partition based batch process.
+There are two different batch boundaries:
 
-Validation reads row batches from the bounded source file. The batch size defaults to `DEFAULT_BATCH_ROWS = 1000`. Each row batch is validated by `BetValidationRowBatchWorker`. Local execution defaults to one validation worker; `--validation-workers` can be increased when concurrent row-batch validation is wanted. The pipeline does not perform a separate full-file row-count pass before validation.
+- **Validation row batch:** `--batch-size` raw CSV rows read and validated at a time.
+- **Feature batch:** one customer-complete `valid_bets/part-*.parquet` partition.
 
-Rows are routed by customer-complete partition routing:
+Validation row batches control memory usage. They are not feature boundaries. A customer can appear in many raw row batches, so feature completeness is enforced by customer partitioning, not by CSV read chunks.
 
-- If `--feature-partition-count` is set, customer routing is deterministic hash modulo the supplied count.
-- If `--feature-partition-count` is not set, `--target-feature-partition-rows` controls dynamic partition creation. It defaults to `DEFAULT_BATCH_ROWS`. New customers are assigned to the current partition until that partition reaches the target. Existing customers always stay in their original partition.
+Feature partitions are customer-complete. Every row for the same `customer_id` is routed to the same partition, so a feature worker can build the first-N feature row without needing records from another partition.
 
-Valid rows are written to `validation/valid_bets/part-*.parquet`. Invalid rows are written to `validation/invalid_bets/part-*.parquet`. Feature generation reads only the valid-bets partitions.
+Concurrency is compatible with this model:
 
-Partition routing and parquet writes are coordinated in source-row-batch order. That keeps output deterministic even when validation uses multiple workers.
-
-Feature engineering is a partition based batch process. Local execution defaults to one feature worker; `--feature-workers` can be increased when concurrent partition processing is wanted. Each `BetFeaturePartitionWorker` is a partition-based batch worker: it reads one customer-complete valid-bets part and writes the matching `customer_features/part-*.parquet` file, so feature workers do not share writers.
-
-## Concurrency Support
-
-The pipeline supports concurrency in two separate places:
-
-- **Validation concurrency:** local execution defaults to one worker. `--validation-workers` controls how many raw CSV row batches can be validated at the same time when concurrency is enabled. The validation workers only validate rows. Customer-complete partition routing assigns each customer to one partition and coordinates parquet writes in source-row-batch order, so concurrent validation does not change output determinism.
-- **Feature concurrency:** local execution defaults to one worker. `--feature-workers` controls how many customer-complete valid-bets partitions can be processed at the same time when concurrency is enabled. Each feature worker reads one `valid_bets/part-*.parquet` file and writes one matching `customer_features/part-*.parquet` file, so feature workers do not share output writers.
-
-Concurrency improves throughput without changing the logical batch boundaries. Validation row batches are memory boundaries. Feature partitions are customer-completeness boundaries.
+- `--validation-workers` can validate multiple raw row batches concurrently. Partition routing and parquet writes are still coordinated in source-row-batch order.
+- `--feature-workers` can process multiple valid-bets partitions concurrently. Each worker writes a distinct feature parquet part, so workers do not share output writers.
 
 ## Why Batch
 
-The required output is a reproducible customer-level dataset derived from historical first-N betting records. Batch processing is a good fit because training, batch scoring, BI, and CRM workflows need a stable feature snapshot with lineage.
+The required output is a reproducible customer-level dataset derived from historical first-N betting behavior. Batch is the right default because training, batch scoring, BI, and CRM activation need stable snapshots with lineage, schema versions, feature versions, and rerun behavior.
 
-Streaming would be useful for live risk decisions or real-time activation, but it would require stateful per-customer feature storage, late-arrival handling, and online/offline feature consistency controls. For this task, batch keeps the system easier to audit and rerun.
-
-## Customer Completeness
-
-Feature generation must use each customer's first N bets by authoritative `bet_num`. A customer can appear in many validation row batches, so row batches cannot be feature boundaries.
-
-The feature partition is the customer-completeness boundary. Every row for the same `customer_id` is routed to the same partition. That means `BetFeaturePartitionWorker` can build customer features from one valid-bets part without needing records from another part.
-
-`--target-feature-partition-rows` is approximate. The pipeline will not split a customer to hit that target. If one customer has many rows, that partition can exceed the target. Customer completeness is more important than equal file size.
-
-Concurrent feature generation, when enabled, does not change feature semantics. It only changes how many customer-complete partitions are processed at once.
+Streaming could be useful for real-time risk decisions or live customer activation, but it would need stateful per-customer storage, late-event handling, watermarks, and strict online/offline feature consistency. This implementation is intentionally a bounded batch pipeline. It can read a large CSV as a stream of row batches, but it is not a streaming event pipeline.
 
 ## Validation And Schema Safety
 
-Validation enforces the row-level business rules:
+Validation enforces the row-level rules from the task:
 
 - `betting_amount > 0`
 - `price > 1`
@@ -136,17 +83,17 @@ Validation enforces the row-level business rules:
 - `return_for_entain` formula by `bet_result` and `stake_type`
 - parseable identifiers, timestamps, and numeric values
 
-The batch writes parquet using explicit Arrow schemas. Reports include schema and feature-set versions. Breaking changes should create a new schema or feature-set version rather than changing existing semantics in place.
+Curated outputs use explicit Arrow schemas from `schema.py`. Validation reports include `schema_version`; feature reports include `feature_set_version`, `feature_columns`, and `first_n_bets`. Breaking schema or feature changes should create a new version instead of changing existing semantics in place.
 
-The local row-batch validation pass does not do a global full-file precheck for cross-row constraints. In a larger production system, constraints such as global `bet_id` uniqueness or full customer bet-number sequence checks should be handled by a distributed validation stage or table-level quality check before publishing.
+The local row-batch validation path does not hold full-file state for global checks such as complete `bet_id` uniqueness or full customer bet-number sequence validation. In a larger production platform, those constraints should be handled by a distributed table-quality check before publishing.
 
 ## Invalid Records
 
-Invalid rows are isolated under `validation/invalid_bets/`. They are not used for feature generation and are not silently discarded.
+Invalid records are isolated under `validation/invalid_bets/`. They are not used for feature generation and are not silently interpolated.
 
-Each invalid row includes original values, source row number, validation errors, and validation timestamp. Operators can inspect `validation_report.json`, identify failure counts by rule, correct upstream data, and rerun the batch.
+Each invalid row keeps the original values plus `source_row_number`, `validation_errors`, and `validated_at`. Operators can inspect `validation_report.json`, correct upstream data, then rerun or backfill.
 
-If invalid records appear inside a customer's first-N window, behavior is deterministic:
+If invalid rows appear inside a customer's first-N window, behavior is deterministic:
 
 1. Invalid rows are quarantined.
 2. Feature generation uses only valid rows where `bet_num <= first_n_bets`.
@@ -155,57 +102,90 @@ If invalid records appear inside a customer's first-N window, behavior is determ
 5. `nth_bet_datetime` is present only when the valid `bet_num == first_n_bets` row exists.
 6. `customers_with_incomplete_first_n` is reported.
 
-## Feature Definitions And Consumers
+This avoids inventing or interpolating financial outcomes.
 
-Feature definitions live in `BetFeatureBuilder` and are reported through `feature_set_version`, `feature_columns`, and `first_n_bets`. Consumers should rely on the parquet schema and feature report, not only file names.
+## Feature Definitions
 
-The customer-level feature row is intentionally compact and auditable. It uses the first-N validated bets by authoritative `bet_num` and produces:
+The feature output has one row per `customer_id`. It is built from validated rows only, using each customer's first N bets by authoritative `bet_num`; default N is 20.
 
-| Feature group | Fields | Reason |
+| Feature group | Fields | Why it is useful |
 | --- | --- | --- |
-| Window lineage | `first_bet_datetime`, `nth_bet_datetime`, `bets_used`, `feature_generated_at` | Tells consumers what early window was observed, whether the full window was available, and when the feature row was produced. |
-| Stake behavior | `total_betting_amount`, `mean_betting_amount` | Captures both total early stake volume and typical stake size. |
-| Price behavior | `mean_price` | Summarizes early odds profile, which can proxy for risk preference or bet style. |
-| Product and funding mix | `pct_racing`, `pct_cash` | Converts categorical behavior into numeric model features for product preference and cash-versus-bonus usage. |
-| Outcome and value | `pct_return`, `total_payout`, `total_return_for_entain` | Captures early return frequency, customer payout experience, and value to Entain. |
+| Window lineage | `first_bet_datetime`, `nth_bet_datetime`, `bets_used`, `feature_generated_at` | Shows whether the early customer window is complete and when features were produced. |
+| Stake behavior | `total_betting_amount`, `mean_betting_amount` | Captures early stake volume and typical stake size. |
+| Price behavior | `mean_price` | Summarizes early odds profile, which can proxy for betting style or risk preference. |
+| Product and funding mix | `pct_racing`, `pct_cash` | Converts categorical behavior into stable numeric features for model consumers. |
+| Outcome and value | `pct_return`, `total_payout`, `total_return_for_entain` | Captures early return frequency, payout experience, and value to Entain. |
 
-Sums are used where total exposure matters. Means are used where typical behavior should be comparable across customers with different valid-row counts. Percentages are used for categorical fields so downstream models and scoring jobs receive stable numeric inputs.
+Sums are used where total exposure matters. Means are used where typical behavior should be comparable across customers with different valid-row counts. Percentages are used for categorical fields so downstream systems receive numeric features.
 
-Downstream systems should read only committed runs that contain `_SUCCESS`:
+## Checkpoint Reuse
 
-- Batch training records `run_id`, schema version, and feature-set version with the model.
-- Batch scoring checks the expected feature-set version before scoring.
-- BI, CRM, and decisioning systems consume the committed feature dataset or a promoted serving table built from it.
+`build-features --from-validation-run` is the checkpoint pickup path.
+
+It exists to save time on large inputs. Validation can be the expensive part of the workflow because it reads the raw file, parses every row, applies schema and business rules, quarantines invalid records, and writes customer-complete valid/invalid parquet partitions. Once that stage has produced a committed validation run, feature generation can start from the validated parquet checkpoint instead of doing the same validation work again.
+
+It is allowed only when:
+
+- the validation run directory has `_SUCCESS`
+- `validation/validation_report.json` exists
+- `validation/valid_bets/part-*.parquet` exists for every expected feature partition
+- `validation/invalid_bets/part-*.parquet` exists for every expected feature partition
+- the validation report `schema_version` matches the current `SCHEMA_VERSION`
+
+When reuse is enabled, the pipeline skips:
+
+- raw CSV reading
+- row-batch validation
+- payout and `return_for_entain` formula checks
+- invalid-record quarantine creation
+- customer-complete valid/invalid partition writing
+
+It still runs:
+
+- validation checkpoint safety checks
+- feature generation over the existing `valid_bets/part-*.parquet`
+- feature report creation
+- run manifest creation
+- ACID-style staging and publish for the new feature run
+
+The feature run writes a new run id such as `001-features`. Its manifest and feature report record:
+
+- `reused_validation_checkpoint: true`
+- `source_validation_run_id: 001`
+- validation output paths pointing back to the committed validation run
+
+The feature run does not copy validation artifacts into its own run directory. Its `outputs.validation_dir`, `outputs.valid_bets_dir`, and `outputs.invalid_bets_dir` point back to the committed validation checkpoint. The committed validation run is never mutated. This preserves immutability and avoids mixing feature publication state into a validation checkpoint.
+
+Using the same run id for both validation and feature generation is intentionally avoided. A committed validation run should remain immutable. A feature run should use a new run id and reference the validation checkpoint through lineage metadata.
 
 ## Reruns, Backfills, And ACID
 
-Runs write to `outputs/_staging/<run_id>/` first. Consumers should never read staging paths. After validation, optional feature generation, reports, and manifest are present, `RunArtifactPublisher` checks required artifacts, writes `_SUCCESS`, and publishes to `outputs/runs/<run_id>/`.
+Runs write to `outputs/_staging/<run_id>/` first. Consumers should never read staging paths.
 
-The ACID-style setup applies to both commands:
+For a normal validation or raw feature run, staged artifacts include validation outputs, reports, manifest, and optional feature outputs. For a checkpoint-based feature run, staged artifacts include feature outputs, manifest, and a lineage reference to the existing validation checkpoint.
 
-- `validate` commits validation artifacts only.
-- `build-features` commits validation artifacts plus feature artifacts.
+Before commit, `RunArtifactPublisher` checks required files and partition parts. It writes `_SUCCESS`, then publishes the staged directory to `outputs/runs/<run_id>`.
 
-For the local filesystem implementation:
+Local ACID-style behavior:
 
 - **Atomicity:** failed runs are removed from staging; successful runs publish only after required artifacts exist.
 - **Consistency:** schemas, reports, manifest, and partition files are checked before commit.
-- **Isolation:** consumers read only committed run directories.
-- **Durability:** after the filesystem rename succeeds, committed artifacts remain under `runs/<run_id>/`.
-
-Object stores usually do not provide atomic directory rename. A production cloud implementation should use immutable part files plus a transaction manifest, or a table format such as Iceberg, Delta, or Hudi.
+- **Isolation:** consumers read only committed run directories with `_SUCCESS`.
+- **Durability:** after the filesystem publish succeeds, committed artifacts remain under `runs/<run_id>`.
 
 Backfills and corrections should create new immutable runs. Reusing a run id should be reserved for controlled reruns where the old staged or committed path has been intentionally removed.
 
-## Test Strategy
+Object stores do not usually provide atomic directory rename. A production cloud implementation should use immutable part files plus a transaction manifest, or a table format such as Iceberg, Delta, or Hudi.
 
-The repository includes three levels of automated checks:
+## Downstream Consumption
 
-- **Lint and formatting:** `.github/scripts/run_lint.sh` runs Ruff formatting checks and lint rules against `src` and `tests`.
-- **Unit tests:** `.github/scripts/run_tests.sh` runs `unittest` discovery against `tests/unit/`. These tests cover validation rules, payout and return formulas, customer-complete partitioning, first-N feature behavior, invalid first-N handling, CLI orchestration, validation worker compatibility, and feature worker compatibility.
-- **E2E integration test:** `tests/integrate/test_docker_pipeline.py` is a pytest test that builds the Docker image, runs `bet-pipeline build-features` end to end against the small fixture at `tests/integrate/fixtures/bets.csv`, and verifies committed run artifacts such as `_SUCCESS`, `run_manifest.json`, validation reports, feature reports, and parquet partition outputs. It also checks the ACID-style publish contract, invalid-record quarantine content, valid parquet rows, customer-complete partitioning, and customer feature values.
+Downstream consumers should read only committed feature runs that contain `_SUCCESS`.
 
-GitHub Actions runs these checks on push. The `Tests` workflow has separate `unit-tests` and `e2e-integration-tests` jobs. The unit test job uploads `unit-test-outputs`, which contains the verbose unittest log. The E2E job uploads `integration-test-outputs`, which contains the pytest log and JUnit XML, and also uploads the generated `integration_outputs/` directory as `docker-integration-outputs` so reviewers can inspect the committed batch outputs from the workflow run. The `Lint` workflow uploads `lint-outputs`, which contains the Ruff format-check and lint logs.
+- Batch training records `run_id`, `schema_version`, and `feature_set_version` with the model artifact.
+- Batch scoring checks the expected feature-set version before scoring.
+- BI, CRM, and decisioning systems consume committed feature parquet or a promoted serving table derived from it.
+
+The contract for consumers is parquet schema plus `feature_report.json` plus `run_manifest.json`. File names alone are not enough.
 
 ## Monitoring And Alerts
 
@@ -215,18 +195,28 @@ Production monitoring should capture:
 - failure counts by validation rule
 - validation batch count and batch size
 - feature partition count and output part count
-- customer feature row count
+- feature row count
 - customers with incomplete first-N windows
-- runtime by validation, feature, and publish stage
+- runtime by validation, checkpoint load, feature generation, and publish stage
 - missing part files or missing `_SUCCESS`
 - schema version and feature-set version
 
 Alerts should fire on missing required columns, invalid-rate spikes, empty feature output, missing partition files, failed publish, unexpected schema or feature version, or consumers attempting to read uncommitted paths.
 
-## Trade-Offs
+## Tests
 
-The implementation is intentionally local and vendor-neutral. It uses parquet for typed, compressed batch outputs and JSON for small operational reports.
+The repository has three automated check layers:
 
-The dynamic target-row partitioning avoids a full-file count pass, but partition count depends on source order and customer skew. If a production run needs stable partition numbering across reruns, use `--feature-partition-count`.
+- **Lint and formatting:** `.github/scripts/run_lint.sh` runs Ruff formatting checks and lint rules against `src` and `tests`.
+- **Unit tests:** `.github/scripts/run_tests.sh` runs `unittest` discovery against `tests/unit/`.
+- **Docker E2E integration:** `tests/integrate/test_docker_pipeline.py` builds the Docker image, runs the pipeline end to end, checks ACID-style publish behavior, verifies parquet outputs, and covers checkpoint reuse from a committed validation run.
 
-Feature generation currently reads one valid-bets partition into a worker. That is acceptable when partitions are sized correctly. For very large or skewed customers, production should either increase worker resources, tune partition settings, or use a distributed engine that can keep per-customer state safely.
+GitHub Actions separates lint, unit tests, and E2E integration tests. CI uploads logs and generated integration outputs as artifacts for review.
+
+## Trade-Offs And Assumptions
+
+The implementation is local and vendor-neutral. It uses parquet for typed batch outputs and JSON for small operational reports.
+
+Dynamic target-row partitioning avoids a full-file row-count pass, but partition count depends on source order and customer skew. If stable partition numbering is required across reruns, use `--feature-partition-count`.
+
+Feature generation reads one valid-bets partition into a worker. That is acceptable when partitions are sized correctly. For very large or skewed customers, production should tune partition settings, increase worker resources, or use a distributed engine that can keep per-customer state safely.

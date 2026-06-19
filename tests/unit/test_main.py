@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from bet_pipeline import main
-from bet_pipeline.batch import ValidationBatchSettings
+from bet_pipeline.batch import ValidationBatchSettings, ValidationCheckpoint
 
 
 def _manifest() -> dict:
@@ -15,6 +15,8 @@ def _manifest() -> dict:
         "run_id": "run",
         "status": "success",
         "input_path": "data/bets.csv",
+        "reused_validation_checkpoint": False,
+        "source_validation_run_id": None,
         "started_at": "2024-01-01T00:00:00+00:00",
         "finished_at": "2024-01-01T00:00:01+00:00",
         "validation": {
@@ -296,6 +298,51 @@ class MainTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             run_class.assert_called_once_with(Path("outputs"), None)
+
+    def test_build_features_reuses_validation_checkpoint(self) -> None:
+        with (
+            patch("bet_pipeline.main.RunArtifactPublisher") as run_class,
+            patch("bet_pipeline.main.ValidationCheckpointLoader") as checkpoint_loader_class,
+            patch("bet_pipeline.main.BetValidationBatchProcess") as validation_process_class,
+            patch("bet_pipeline.main.BetFeatureBatchProcess") as feature_process_class,
+        ):
+            run = run_class.return_value
+            run.features_dir = "outputs/_staging/features-001/features"
+            run.feature_generated_at = "2024-01-01T00:00:01+00:00"
+            partitioned_input = SimpleNamespace(source_validation_run_id="001")
+            report = {"total_rows": 10, "valid_rows": 9, "invalid_rows": 1}
+            feature_result = SimpleNamespace(feature_count=2, incomplete_first_n_count=0)
+            checkpoint_loader_class.return_value.load.return_value = ValidationCheckpoint(partitioned_input, report)
+            feature_process_class.return_value.process.return_value = feature_result
+            run.write_manifest.return_value = _manifest()
+
+            exit_code = main.main(
+                [
+                    "build-features",
+                    "--from-validation-run",
+                    "outputs/runs/001",
+                    "--output",
+                    "outputs",
+                    "--run-id",
+                    "001-features",
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            run_class.assert_called_once_with(Path("outputs"), "001-features")
+            checkpoint_loader_class.assert_called_once_with("outputs/runs/001")
+            validation_process_class.assert_not_called()
+            run.write_validation_report.assert_not_called()
+            feature_process_class.return_value.process.assert_called_once_with(
+                partitioned_input,
+                "outputs/_staging/features-001/features",
+                "2024-01-01T00:00:01+00:00",
+                first_n_bets=20,
+                feature_worker_count=1,
+            )
+            run.write_feature_report.assert_called_once_with(partitioned_input, report, feature_result)
+            run.write_manifest.assert_called_once_with(partitioned_input, report, feature_result)
+            run.commit.assert_called_once_with(partitioned_input)
 
     def test_validate_normalizes_validation_output_to_batch_root(self) -> None:
         with (

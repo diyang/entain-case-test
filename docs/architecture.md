@@ -1,82 +1,84 @@
 # Architecture
 
-## Pipeline Diagram
+## Main Batch Flow
 
 ```mermaid
 flowchart TD
-    raw["Raw betting data<br/>landing area"]
-    trigger["Scheduler / job trigger"]
+    raw["Raw betting data landing area<br/>data/bets.csv"]
+    trigger["Scheduler or job trigger<br/>validate / build-features"]
 
-    subgraph validation_batch["Validation batch process"]
+    subgraph validation["Validation batch process"]
         direction TD
-        scan["CSV row-batch reader<br/>read --batch-size rows"]
-        workers["Concurrency-compatible row-batch workers<br/>validate rows<br/>schema + business rules"]
-        router["Customer-complete partition routing<br/>customer_id -> partition<br/>ordered parquet writes"]
-        valid["Curated validated-bets batches<br/>customer-complete partitions<br/>valid_bets/part-*.parquet"]
+        read["Read CSV in row batches<br/>--batch-size"]
+        validate["BetValidationRowBatchWorker<br/>schema + business rules"]
+        route["Customer-complete partition routing<br/>customer_id stays in one partition"]
+        valid["Curated validated bets<br/>valid_bets/part-*.parquet"]
         invalid["Invalid-record quarantine<br/>invalid_bets/part-*.parquet"]
 
-        scan --> workers --> router
-        router --> valid
-        router --> invalid
+        read --> validate --> route
+        route --> valid
+        route --> invalid
     end
 
-    subgraph feature_engineering["Optional Feature Engineering partition based batch process"]
+    subgraph features["Feature Engineering partition-based batch process"]
         direction TD
-        feature["Customer feature generation<br/>concurrency-compatible partition-based batch workers"]
-        output["Versioned feature output<br/>customer_features/part-*.parquet"]
+        feature_worker["BetFeaturePartitionWorker<br/>one worker per valid-bets partition"]
+        feature_output["Versioned customer features<br/>customer_features/part-*.parquet"]
 
-        feature --> output
+        feature_worker --> feature_output
     end
 
     publish["ACID-style publish<br/>_staging -> runs + _SUCCESS"]
-    run["Committed run<br/>outputs/runs/run_id"]
+    committed["Committed run<br/>outputs/runs/run_id"]
+    consumers["Downstream consumers<br/>training / scoring / BI / CRM"]
+    review["Operator review and source correction"]
+    rerun["Rerun or backfill"]
 
-    raw --> trigger --> scan
+    raw --> trigger --> read
+    valid --> feature_worker
     valid --> publish
     invalid --> publish
-    valid -- "build-features only" --> feature
-    output -- "build-features only" --> publish
-    publish --> run
-
-    review["Operator review<br/>source correction"]
-    rerun["Rerun or backfill"]
+    feature_output --> publish
+    publish --> committed --> consumers
     invalid --> review --> rerun --> trigger
+```
 
-    run -- "feature run" --> training["Batch model training"]
-    run -- "feature run" --> scoring["Batch scoring"]
-    run -- "feature run" --> analytics["BI / CRM / decisioning"]
+## Validation Checkpoint Reuse
+
+```mermaid
+flowchart TD
+    checkpoint["Committed validation run<br/>outputs/runs/001<br/>_SUCCESS required"]
+    loader["ValidationCheckpointLoader<br/>verify schema_version<br/>load valid_bets partitions"]
+    feature_worker["Feature Engineering partition-based batch process"]
+    feature_run["New feature run<br/>outputs/runs/001-features<br/>source_validation_run_id = 001"]
+
+    checkpoint --> loader --> feature_worker --> feature_run
 ```
 
 ## Execution Model
 
-Both public commands run a staged batch workflow:
+The pipeline has two public commands:
 
-1. `bet_pipeline.main` creates a staged run through `RunArtifactPublisher`.
-2. `BetValidationBatchProcess` reads the bounded raw CSV in row batches with `--batch-size`.
-3. For each row batch, a validation row-batch worker validates rows against schema and business rules.
-4. Local execution defaults to one validation worker. `--validation-workers` can be increased to validate row batches concurrently.
-5. Customer-complete partition routing receives validated row-batch results in source order, keeps every `customer_id` in one feature partition, and writes customer-complete `valid_bets/part-*.parquet` batches.
-6. If the command is `validate`, the run stops after validation artifacts are written and committed.
-7. If the command is `build-features`, `BetFeatureBatchProcess` runs the optional feature engineering partition based batch process. It reads `valid_bets/part-*.parquet`; each valid part is one customer-complete feature batch handled by a partition-based batch worker.
-8. Local execution defaults to one feature worker. `--feature-workers` can be increased to process feature partitions concurrently. Each worker writes one distinct `customer_features/part-*.parquet` file.
-9. `RunArtifactPublisher` checks required artifacts, writes `_SUCCESS`, and publishes `outputs/runs/<run_id>`.
+1. `validate` reads raw CSV, validates row batches, writes customer-complete validation partitions, and commits a validation run.
+2. `build-features --input ...` runs validation first, then builds customer features from the new valid-bets partitions.
+3. `build-features --from-validation-run outputs/runs/<validation_run_id>` skips raw CSV validation and builds features from an already committed validation checkpoint.
 
-## Partitioning
+The validation checkpoint path is the faster path for large inputs when validation has already completed. It requires `_SUCCESS`, checks that the validation `schema_version` matches the current code, records `source_validation_run_id` in the feature manifest, writes features into a new run id, and never mutates the committed validation run.
 
-There is no full-file row-count pass before validation.
+## Batch Boundaries
 
-`--target-feature-partition-rows` defaults to `DEFAULT_BATCH_ROWS = 1000`. If `--feature-partition-count` is not supplied, new customers are assigned to dynamic feature partitions until the current partition reaches that target. Existing customers always stay in their original partition.
+- Validation batch: `--batch-size` raw CSV rows read and validated at a time.
+- Feature batch: one customer-complete `valid_bets/part-*.parquet` partition.
+- `--validation-workers` can validate row batches concurrently.
+- `--feature-workers` can process feature partitions concurrently.
+- Partition routing keeps every `customer_id` in one valid-bets partition, so first-N customer features are complete.
 
-If `--feature-partition-count` is supplied, routing uses deterministic `hash(customer_id) % N`.
+## Production Controls
 
-## Guarantees
+These controls are intentionally kept out of the main diagram so the data flow stays readable:
 
-- Row batches control validation memory usage; they are not feature boundaries.
-- `valid_bets/part-*.parquet` is the batch-processing boundary for feature generation.
-- Feature partitions are customer-complete, so first-N customer features are not split across row batches.
-- The validation design is concurrency-compatible because partition routing and parquet writes are coordinated in source-row-batch order.
-- The feature design is concurrency-compatible because each feature worker owns one output partition file.
-- Invalid records are quarantined and excluded from feature generation.
-- Downstream systems should consume only committed `outputs/runs/<run_id>/` directories with `_SUCCESS`.
-- Local ACID behavior is provided by staging first, checking required artifacts, then publishing the run directory.
-- Schema contracts, feature definitions, run manifests, reports, metrics, and alerts still exist in the system; they are kept out of the diagram to keep the data flow readable.
+- Schema contracts live in `schema.py` and are versioned through `SCHEMA_VERSION`.
+- Feature definitions live in `features.py` and are versioned through `FEATURE_SET_VERSION`.
+- JSON reports and run manifests record row counts, failure counts, feature counts, schema version, feature version, output paths, and checkpoint lineage.
+- Monitoring should alert on failed runs, missing `_SUCCESS`, invalid-rate spikes, empty feature output, missing partition files, or schema/version mismatches.
+- Downstream systems should read only committed `outputs/runs/<run_id>/` paths with `_SUCCESS`.

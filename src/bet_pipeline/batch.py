@@ -17,6 +17,7 @@ from bet_pipeline.io import (
     ensure_dir,
     iter_csv_batches,
     read_csv_fieldnames,
+    read_json,
     read_parquet,
     write_json,
     write_parquet,
@@ -64,6 +65,14 @@ class PartitionedInput:
     source_fingerprint: dict[str, object]
     batch_size: int
     feature_partition_count: int
+    source_validation_run_id: str | None = None
+    source_validation_run_dir: str | None = None
+
+
+@dataclass(frozen=True)
+class ValidationCheckpoint:
+    partitioned_input: PartitionedInput
+    validation_report: dict
 
 
 @dataclass(frozen=True)
@@ -419,6 +428,96 @@ class BetValidationBatchProcess:
         return valid_partition_rows, invalid_partition_rows
 
 
+class ValidationCheckpointLoader:
+    """Load a committed validation run as the input to feature generation."""
+
+    def __init__(self, validation_run_dir: str | Path) -> None:
+        self.validation_run_dir = Path(validation_run_dir)
+        self.validation_dir = self.validation_run_dir / "validation"
+        self.valid_bets_dir = self.validation_dir / "valid_bets"
+        self.invalid_bets_dir = self.validation_dir / "invalid_bets"
+
+    def load(self) -> ValidationCheckpoint:
+        self._assert_committed_run()
+        validation_report = read_json(self.validation_dir / "validation_report.json")
+        self._assert_schema_compatible(validation_report)
+        partition_count = self._int_value(validation_report, "feature_partition_count")
+        partition_paths = self._partition_paths(self.valid_bets_dir, partition_count)
+        invalid_partition_paths = self._partition_paths(self.invalid_bets_dir, partition_count)
+
+        return ValidationCheckpoint(
+            partitioned_input=PartitionedInput(
+                fieldnames=list(EXPECTED_COLUMNS),
+                partition_paths=partition_paths,
+                invalid_partition_paths=invalid_partition_paths,
+                total_rows=self._int_value(validation_report, "total_rows"),
+                batches_processed=self._int_value(validation_report, "batches_processed"),
+                valid_rows=self._int_value(validation_report, "valid_rows"),
+                invalid_rows=self._int_value(validation_report, "invalid_rows"),
+                failure_counts_by_rule=self._failure_counts(validation_report),
+                source_path=str(validation_report.get("input_path", "")),
+                source_fingerprint=self._dict_value(validation_report, "input_fingerprint"),
+                batch_size=self._int_value(validation_report, "batch_size"),
+                feature_partition_count=partition_count,
+                source_validation_run_id=self._source_validation_run_id(),
+                source_validation_run_dir=str(self.validation_run_dir),
+            ),
+            validation_report=validation_report,
+        )
+
+    def _assert_committed_run(self) -> None:
+        success_marker = self.validation_run_dir / "_SUCCESS"
+        if not success_marker.is_file():
+            raise FileNotFoundError(f"Validation checkpoint is not committed: missing {success_marker}")
+        required_paths = [
+            self.validation_dir / "validation_report.json",
+            self.valid_bets_dir,
+            self.invalid_bets_dir,
+        ]
+        missing_paths = [path for path in required_paths if not path.exists()]
+        if missing_paths:
+            missing = ", ".join(str(path) for path in missing_paths)
+            raise FileNotFoundError(f"Validation checkpoint is incomplete. Missing: {missing}")
+
+    def _assert_schema_compatible(self, validation_report: dict) -> None:
+        schema_version = validation_report.get("schema_version")
+        if schema_version != SCHEMA_VERSION:
+            raise ValueError(
+                f"Validation checkpoint schema_version {schema_version!r} does not match expected {SCHEMA_VERSION!r}"
+            )
+
+    def _partition_paths(self, partition_dir: Path, partition_count: int) -> list[Path]:
+        partition_paths = [
+            partition_dir / f"part-{partition_index:05d}.parquet" for partition_index in range(partition_count)
+        ]
+        missing_paths = [path for path in partition_paths if not path.is_file()]
+        if missing_paths:
+            missing = ", ".join(str(path) for path in missing_paths)
+            raise FileNotFoundError(f"Validation checkpoint is missing partition files: {missing}")
+        return partition_paths
+
+    def _failure_counts(self, validation_report: dict) -> dict[str, int]:
+        failure_counts = validation_report.get("failure_counts_by_rule", {})
+        if not isinstance(failure_counts, dict):
+            return {}
+        return {str(rule): int(count) for rule, count in failure_counts.items()}
+
+    def _dict_value(self, payload: dict, key: str) -> dict[str, object]:
+        value = payload.get(key, {})
+        if isinstance(value, dict):
+            return value
+        return {}
+
+    def _int_value(self, payload: dict, key: str) -> int:
+        value = payload.get(key)
+        if isinstance(value, int):
+            return value
+        raise ValueError(f"Validation checkpoint report field {key!r} must be an integer")
+
+    def _source_validation_run_id(self) -> str:
+        return self.validation_run_dir.name
+
+
 class BetFeaturePartitionWorker:
     """Build and publish features for one customer-complete feature partition."""
 
@@ -582,7 +681,7 @@ class RunArtifactPublisher:
         if self.committed_dir.exists():
             raise FileExistsError(f"Committed run already exists: {self.committed_dir}")
 
-        self.validation_dir = ensure_dir(self.staging_dir / "validation")
+        self.validation_dir = self.staging_dir / "validation"
         self.features_dir = self.staging_dir / "features"
         self.validation_generated_at = self._now_iso()
         self.feature_generated_at = self._now()
@@ -604,6 +703,9 @@ class RunArtifactPublisher:
                 "input_path": partitioned_input.source_path,
                 "input_fingerprint": partitioned_input.source_fingerprint,
                 "validated_before_feature_generation": True,
+                "reused_validation_checkpoint": partitioned_input.source_validation_run_id is not None,
+                "source_validation_run_id": partitioned_input.source_validation_run_id,
+                "source_validation_run_dir": partitioned_input.source_validation_run_dir,
                 "invalid_rows_excluded": validation_report["invalid_rows"],
                 "run_id": self.run_id,
                 "generated_at": self.feature_generated_at.isoformat(timespec="seconds"),
@@ -683,6 +785,7 @@ class RunArtifactPublisher:
             feature_worker_count = feature_result.feature_worker_count
         else:
             feature_worker_count = None
+        validation_dir = self._published_validation_dir(partitioned_input)
 
         return {
             "run_id": self.run_id,
@@ -690,11 +793,13 @@ class RunArtifactPublisher:
             "finished_at": self._now().isoformat(timespec="seconds"),
             "status": "success",
             "input_path": partitioned_input.source_path,
+            "reused_validation_checkpoint": partitioned_input.source_validation_run_id is not None,
+            "source_validation_run_id": partitioned_input.source_validation_run_id,
             "outputs": {
                 "run_dir": str(self.committed_dir),
-                "validation_dir": str(self.committed_dir / "validation"),
-                "valid_bets_dir": str(self.committed_dir / "validation" / "valid_bets"),
-                "invalid_bets_dir": str(self.committed_dir / "validation" / "invalid_bets"),
+                "validation_dir": str(validation_dir),
+                "valid_bets_dir": str(validation_dir / "valid_bets"),
+                "invalid_bets_dir": str(validation_dir / "invalid_bets"),
                 "features_dir": str(self.committed_dir / "features"),
                 "manifest": str(self.committed_dir / "run_manifest.json"),
                 "success_marker": str(self.committed_dir / "_SUCCESS"),
@@ -713,12 +818,17 @@ class RunArtifactPublisher:
         }
 
     def _assert_staged_artifacts(self, partitioned_input: PartitionedInput) -> None:
-        required_paths = [
-            self.validation_dir / "valid_bets",
-            self.validation_dir / "invalid_bets",
-            self.validation_dir / "validation_report.json",
-            self.staging_dir / "run_manifest.json",
-        ]
+        required_paths = [self.staging_dir / "run_manifest.json"]
+        if partitioned_input.source_validation_run_dir is None:
+            required_paths.extend(
+                [
+                    self.validation_dir / "valid_bets",
+                    self.validation_dir / "invalid_bets",
+                    self.validation_dir / "validation_report.json",
+                ]
+            )
+        else:
+            required_paths.extend(self._source_validation_paths(partitioned_input))
         if self.features_dir.exists():
             required_paths.extend(
                 [
@@ -727,23 +837,45 @@ class RunArtifactPublisher:
                 ]
             )
         missing_paths = [path for path in required_paths if not path.exists()]
-        missing_paths.extend(self._missing_partition_files(partitioned_input.feature_partition_count))
+        missing_paths.extend(self._missing_partition_files(partitioned_input))
         if missing_paths:
             missing = ", ".join(str(path) for path in missing_paths)
             raise FileNotFoundError(f"Cannot commit incomplete run. Missing: {missing}")
 
-    def _missing_partition_files(self, feature_partition_count: int) -> list[Path]:
+    def _source_validation_paths(self, partitioned_input: PartitionedInput) -> list[Path]:
+        if partitioned_input.source_validation_run_dir is None:
+            return []
+        source_validation_run_dir = Path(partitioned_input.source_validation_run_dir)
+        return [
+            source_validation_run_dir / "_SUCCESS",
+            source_validation_run_dir / "validation" / "validation_report.json",
+            source_validation_run_dir / "validation" / "valid_bets",
+            source_validation_run_dir / "validation" / "invalid_bets",
+        ]
+
+    def _missing_partition_files(self, partitioned_input: PartitionedInput) -> list[Path]:
         required_files = []
-        for partition_index in range(feature_partition_count):
-            required_files.extend(
-                [
-                    parquet_partition_file(self.validation_dir, "valid_bets", partition_index),
-                    parquet_partition_file(self.validation_dir, "invalid_bets", partition_index),
-                ]
-            )
+        if partitioned_input.source_validation_run_dir is None:
+            for partition_index in range(partitioned_input.feature_partition_count):
+                required_files.extend(
+                    [
+                        parquet_partition_file(self.validation_dir, "valid_bets", partition_index),
+                        parquet_partition_file(self.validation_dir, "invalid_bets", partition_index),
+                    ]
+                )
+        else:
+            required_files.extend(partitioned_input.partition_paths)
+            required_files.extend(partitioned_input.invalid_partition_paths)
+
+        for partition_index in range(partitioned_input.feature_partition_count):
             if self.features_dir.exists():
                 required_files.append(parquet_partition_file(self.features_dir, "customer_features", partition_index))
         return [path for path in required_files if not path.exists()]
+
+    def _published_validation_dir(self, partitioned_input: PartitionedInput) -> Path:
+        if partitioned_input.source_validation_run_dir is not None:
+            return Path(partitioned_input.source_validation_run_dir) / "validation"
+        return self.committed_dir / "validation"
 
     def _resolve_run_id(self, run_id: str | None, started_at: datetime, output_root: Path) -> str:
         if run_id is not None:

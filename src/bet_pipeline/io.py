@@ -45,6 +45,14 @@ def read_parquet(path: str | Path) -> tuple[list[str], list[dict[str, object]]]:
     return list(table.column_names), rows
 
 
+def read_json(path: str | Path) -> dict:
+    with Path(path).open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected JSON object in {path}")
+    return payload
+
+
 def write_parquet(path: str | Path, rows: Iterable[dict[str, object]], schema: pa.Schema) -> None:
     rows = list(rows)
     target = Path(path)

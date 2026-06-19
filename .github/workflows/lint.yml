@@ -26,3 +26,11 @@ jobs:
 
       - name: Run lint checks
         run: bash .github/scripts/run_lint.sh
+
+      - name: Upload lint outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-outputs
+          path: test_outputs/lint/
+          if-no-files-found: warn

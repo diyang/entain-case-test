@@ -26,3 +26,61 @@ jobs:
 
       - name: Run unit tests
         run: bash .github/scripts/run_tests.sh
+
+      - name: Upload unit test outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-outputs
+          path: test_outputs/unit/
+          if-no-files-found: warn
+
+  e2e-integration-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run Docker end-to-end integration test
+        env:
+          OUTPUT_DIR: integration_outputs
+          RUN_ID: github-integration-test
+          BATCH_SIZE: "2"
+          TARGET_FEATURE_PARTITION_ROWS: "3"
+          VALIDATION_WORKERS: "2"
+          FEATURE_WORKERS: "2"
+          FIRST_N_BETS: "2"
+        run: |
+          set -o pipefail
+          mkdir -p test_outputs/integration
+          uv run pytest tests/integrate -v --junitxml=test_outputs/integration/pytest.xml 2>&1 | tee test_outputs/integration/pytest.log
+
+      - name: Upload integration test outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-outputs
+          path: test_outputs/integration/
+          if-no-files-found: warn
+
+      - name: Upload integration outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-integration-outputs
+          path: integration_outputs/
+          if-no-files-found: warn

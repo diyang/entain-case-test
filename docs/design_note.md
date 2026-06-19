@@ -185,6 +185,16 @@ Object stores usually do not provide atomic directory rename. A production cloud
 
 Backfills and corrections should create new immutable runs. Reusing a run id should be reserved for controlled reruns where the old staged or committed path has been intentionally removed.
 
+## Test Strategy
+
+The repository includes three levels of automated checks:
+
+- **Lint and formatting:** `.github/scripts/run_lint.sh` runs Ruff formatting checks and lint rules against `src` and `tests`.
+- **Unit tests:** `.github/scripts/run_tests.sh` runs `unittest` discovery against `tests/unit/`. These tests cover validation rules, payout and return formulas, customer-complete partitioning, first-N feature behavior, invalid first-N handling, CLI orchestration, validation worker compatibility, and feature worker compatibility.
+- **E2E integration test:** `tests/integrate/test_docker_pipeline.py` is a pytest test that builds the Docker image, runs `bet-pipeline build-features` end to end against the small fixture at `tests/integrate/fixtures/bets.csv`, and verifies committed run artifacts such as `_SUCCESS`, `run_manifest.json`, validation reports, feature reports, and parquet partition outputs. It also checks the ACID-style publish contract, invalid-record quarantine content, valid parquet rows, customer-complete partitioning, and customer feature values.
+
+GitHub Actions runs these checks on push. The `Tests` workflow has separate `unit-tests` and `e2e-integration-tests` jobs. The unit test job uploads `unit-test-outputs`, which contains the verbose unittest log. The E2E job uploads `integration-test-outputs`, which contains the pytest log and JUnit XML, and also uploads the generated `integration_outputs/` directory as `docker-integration-outputs` so reviewers can inspect the committed batch outputs from the workflow run. The `Lint` workflow uploads `lint-outputs`, which contains the Ruff format-check and lint logs.
+
 ## Monitoring And Alerts
 
 Production monitoring should capture:

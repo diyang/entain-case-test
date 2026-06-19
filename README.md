@@ -17,6 +17,8 @@ src/bet_pipeline/
   features.py
   io.py
 tests/
+  unit/
+  integrate/
 outputs/
 docs/
   architecture.md
@@ -119,15 +121,23 @@ uv run ruff check src tests
 Unit tests:
 
 ```bash
-uv run python -m unittest discover tests
+uv run python -m unittest discover tests/unit
 ```
 
 Coverage:
 
 ```bash
-uv run python -m coverage run -m unittest discover tests
+uv run python -m coverage run -m unittest discover tests/unit
 uv run python -m coverage report -m
 ```
+
+Docker integration test:
+
+```bash
+uv run pytest tests/integrate -v
+```
+
+The integration test uses `tests/integrate/fixtures/bets.csv`, not the full `data/bets.csv`, so it can run quickly in CI while still exercising Docker build, validation, feature generation, ACID-style publish, and artifact checks.
 
 ## Docker
 
@@ -137,22 +147,22 @@ Build:
 docker build -t entain-bet-pipeline .
 ```
 
-Feature batch:
-
-```bash
-docker run --rm \
-  -v $(pwd)/data:/data \
-  -v $(pwd)/outputs:/outputs \
-  entain-bet-pipeline build-features --input /data/bets.csv --output /outputs --run-id local-001
-```
-
 Validate only:
 
 ```bash
 docker run --rm \
   -v $(pwd)/data:/data \
   -v $(pwd)/outputs:/outputs \
-  entain-bet-pipeline validate --input /data/bets.csv --output /outputs --run-id local-001
+  entain-bet-pipeline validate --input /data/bets.csv --output /outputs/validation/
+```
+
+Feature batch:
+
+```bash
+docker run --rm \
+  -v $(pwd)/data:/data \
+  -v $(pwd)/outputs:/outputs \
+  entain-bet-pipeline build-features --input /data/bets.csv --output /outputs/features/
 ```
 
 ## Validation Rules

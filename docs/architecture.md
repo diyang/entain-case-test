@@ -12,12 +12,13 @@ flowchart TD
         read["Read CSV in row batches<br/>--batch-size"]
         validate["BetValidationRowBatchWorker<br/>schema + business rules"]
         route["Customer-complete partition routing<br/>customer_id stays in one partition"]
+        sequence["Partition sequence finalizer<br/>customer bet_num gap check"]
         valid["Curated validated bets<br/>valid_bets/part-*.parquet"]
         invalid["Invalid-record quarantine<br/>invalid_bets/part-*.parquet"]
 
-        read --> validate --> route
-        route --> valid
-        route --> invalid
+        read --> validate --> route --> sequence
+        sequence --> valid
+        sequence --> invalid
     end
 
     subgraph features["Feature Engineering partition-based batch process"]
@@ -33,6 +34,8 @@ flowchart TD
     consumers["Downstream consumers<br/>training / scoring / BI / CRM"]
     review["Operator review and source correction"]
     rerun["Rerun or backfill"]
+    contracts["Schema, feature, and run configuration<br/>schema.py / features.py / CLI args"]
+    observability["Logging, reports, metrics, and alerts<br/>validation + feature + publish health"]
 
     raw --> trigger --> read
     valid --> feature_worker
@@ -41,6 +44,11 @@ flowchart TD
     feature_output --> publish
     publish --> committed --> consumers
     invalid --> review --> rerun --> trigger
+    contracts -. govern .-> validate
+    contracts -. govern .-> feature_worker
+    validate -. emit metrics .-> observability
+    feature_worker -. emit metrics .-> observability
+    publish -. emit status .-> observability
 ```
 
 ## Validation Checkpoint Reuse

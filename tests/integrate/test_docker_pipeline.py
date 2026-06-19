@@ -64,6 +64,7 @@ class TestDockerPipelineIntegration:
         assert feature_report["validated_before_feature_generation"] is True
         assert feature_report["customers"] == 2
         assert feature_report["first_n_bets"] == 2
+        assert feature_report["window_datetime_column"] == "bet_2_datetime"
         assert feature_report["invalid_rows_excluded"] == 1
         assert feature_report["feature_partition_count"] == len(feature_parts)
 
@@ -240,7 +241,7 @@ class TestDockerPipelineIntegration:
     def _assert_customer_one_features(self, row: dict[str, object]) -> None:
         assert row["bets_used"] == 2
         assert row["first_bet_datetime"].isoformat() == "2024-08-01T00:00:00"
-        assert row["nth_bet_datetime"].isoformat() == "2024-08-02T00:00:00"
+        assert row["bet_2_datetime"].isoformat() == "2024-08-02T00:00:00"
         assert row["total_betting_amount"] == pytest.approx(20.0)
         assert row["mean_betting_amount"] == pytest.approx(10.0)
         assert row["mean_price"] == pytest.approx(2.5)
@@ -253,7 +254,7 @@ class TestDockerPipelineIntegration:
     def _assert_customer_two_features(self, row: dict[str, object]) -> None:
         assert row["bets_used"] == 2
         assert row["first_bet_datetime"].isoformat() == "2024-08-01T00:00:00"
-        assert row["nth_bet_datetime"].isoformat() == "2024-08-02T00:00:00"
+        assert row["bet_2_datetime"].isoformat() == "2024-08-02T00:00:00"
         assert row["total_betting_amount"] == pytest.approx(12.0)
         assert row["mean_betting_amount"] == pytest.approx(6.0)
         assert row["mean_price"] == pytest.approx(2.5)

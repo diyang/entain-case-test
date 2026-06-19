@@ -7,21 +7,32 @@ from decimal import Decimal
 
 from bet_pipeline.schema import EXPECTED_COLUMNS, FEATURE_SET_VERSION
 
-FEATURE_COLUMNS = (
-    "customer_id",
-    "first_bet_datetime",
-    "nth_bet_datetime",
-    "bets_used",
-    "total_betting_amount",
-    "mean_betting_amount",
-    "mean_price",
-    "pct_racing",
-    "pct_cash",
-    "pct_return",
-    "total_payout",
-    "total_return_for_entain",
-    "feature_generated_at",
-)
+
+def window_datetime_column(first_n_bets: int) -> str:
+    if first_n_bets < 1:
+        raise ValueError("first_n_bets must be greater than 0")
+    return f"bet_{first_n_bets}_datetime"
+
+
+def feature_columns_for_window(first_n_bets: int) -> tuple[str, ...]:
+    return (
+        "customer_id",
+        "first_bet_datetime",
+        window_datetime_column(first_n_bets),
+        "bets_used",
+        "total_betting_amount",
+        "mean_betting_amount",
+        "mean_price",
+        "pct_racing",
+        "pct_cash",
+        "pct_return",
+        "total_payout",
+        "total_return_for_entain",
+        "feature_generated_at",
+    )
+
+
+FEATURE_COLUMNS = feature_columns_for_window(20)
 
 VALIDATED_INPUT_POLICY = (
     "Rows are validated first. Feature generation uses only valid rows within the configured first-N bet window; "
@@ -35,13 +46,20 @@ class BetFeatureBuilder:
     def __init__(
         self,
         expected_columns: Sequence[str] = EXPECTED_COLUMNS,
-        feature_columns: Sequence[str] = FEATURE_COLUMNS,
+        feature_columns: Sequence[str] | None = None,
         first_n_bets: int = 20,
         feature_set_version: str = FEATURE_SET_VERSION,
     ) -> None:
+        if first_n_bets < 1:
+            raise ValueError("first_n_bets must be greater than 0")
+
         self.expected_columns = expected_columns
-        self.feature_columns = feature_columns
         self.first_n_bets = first_n_bets
+        self.window_datetime_column = window_datetime_column(first_n_bets)
+        if feature_columns is None:
+            self.feature_columns = feature_columns_for_window(first_n_bets)
+        else:
+            self.feature_columns = feature_columns
         self.feature_set_version = feature_set_version
 
     def build(
@@ -87,7 +105,7 @@ class BetFeatureBuilder:
         return {
             "customer_id": customer_id,
             "first_bet_datetime": self._coerce_datetime(rows[0]["bet_datetime"]),
-            "nth_bet_datetime": self._nth_bet_datetime(rows),
+            self.window_datetime_column: self._window_bet_datetime(rows),
             "bets_used": len(rows),
             "total_betting_amount": float(sum(amounts, Decimal("0"))),
             "mean_betting_amount": float(sum(amounts, Decimal("0")) / denominator),
@@ -100,7 +118,7 @@ class BetFeatureBuilder:
             "feature_generated_at": generated_at,
         }
 
-    def _nth_bet_datetime(self, rows: list[dict[str, object]]) -> datetime | None:
+    def _window_bet_datetime(self, rows: list[dict[str, object]]) -> datetime | None:
         for row in rows:
             if int(row["bet_num"]) == self.first_n_bets:
                 return self._coerce_datetime(row["bet_datetime"])

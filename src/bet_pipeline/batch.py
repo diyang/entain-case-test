@@ -11,7 +11,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from bet_pipeline.features import FEATURE_COLUMNS, VALIDATED_INPUT_POLICY, BetFeatureBuilder
+from bet_pipeline.features import (
+    VALIDATED_INPUT_POLICY,
+    BetFeatureBuilder,
+    feature_columns_for_window,
+    window_datetime_column,
+)
 from bet_pipeline.io import (
     ParquetBatchWriter,
     ensure_dir,
@@ -23,12 +28,12 @@ from bet_pipeline.io import (
     write_parquet,
 )
 from bet_pipeline.schema import (
-    CUSTOMER_FEATURES_SCHEMA,
     EXPECTED_COLUMNS,
     FEATURE_SET_VERSION,
     INVALID_BETS_SCHEMA,
     SCHEMA_VERSION,
     VALID_BETS_SCHEMA,
+    customer_features_schema,
 )
 from bet_pipeline.validation import BetValidator, ValidationInput
 
@@ -89,6 +94,8 @@ class FeatureBatchResult:
     feature_count: int
     incomplete_first_n_count: int
     first_n_bets: int
+    feature_columns: tuple[str, ...]
+    window_datetime_column: str
     feature_worker_count: int = 1
 
 
@@ -216,6 +223,117 @@ class ValidationRowBatchResult:
     next_source_row_number: int
 
 
+@dataclass(frozen=True)
+class ValidationSequenceFinalizationResult:
+    demoted_valid_rows: int
+    failure_counts_by_rule: dict[str, int]
+
+
+class StreamingValidationState:
+    """Track cross-batch uniqueness constraints without loading the whole file."""
+
+    def __init__(self, generated_at: str) -> None:
+        self.generated_at = datetime.fromisoformat(generated_at).astimezone(timezone.utc)
+        self.seen_bet_ids: set[int] = set()
+        self.seen_customer_bet_nums: set[tuple[str, int]] = set()
+
+    def apply(self, result: ValidationRowBatchResult) -> ValidationRowBatchResult:
+        valid_records: list[dict[str, object]] = []
+        invalid_records: list[dict[str, object]] = []
+        failure_counts = Counter(result.failure_counts_by_rule)
+
+        for row_status, record in self._source_ordered_records(result):
+            errors = self._record_errors(record)
+            if row_status == "invalid":
+                if errors:
+                    failure_counts.update(errors)
+                invalid_records.append(self._invalid_record_with_extra_errors(record, errors))
+            elif errors:
+                failure_counts.update(errors)
+                invalid_records.append(self._invalid_record(record, errors))
+            else:
+                valid_records.append(record)
+
+        return ValidationRowBatchResult(
+            total_rows=result.total_rows,
+            valid_rows=len(valid_records),
+            invalid_rows=len(invalid_records),
+            valid_records=valid_records,
+            invalid_records=invalid_records,
+            failure_counts_by_rule=dict(sorted(failure_counts.items())),
+            next_source_row_number=result.next_source_row_number,
+        )
+
+    def _source_ordered_records(self, result: ValidationRowBatchResult) -> list[tuple[str, dict[str, object]]]:
+        records = [("valid", record) for record in result.valid_records]
+        records.extend(("invalid", record) for record in result.invalid_records)
+        return sorted(records, key=lambda item: self._source_row_number(item[1]))
+
+    def _record_errors(self, record: dict[str, object]) -> list[str]:
+        errors: list[str] = []
+        bet_id = self._int_value(record.get("bet_id"))
+        customer_bet_num = self._customer_bet_num(record)
+
+        if bet_id is not None:
+            if bet_id in self.seen_bet_ids:
+                errors.append("bet_id_unique")
+            else:
+                self.seen_bet_ids.add(bet_id)
+
+        if customer_bet_num is not None:
+            if customer_bet_num in self.seen_customer_bet_nums:
+                errors.append("customer_bet_num_unique")
+            else:
+                self.seen_customer_bet_nums.add(customer_bet_num)
+
+        return errors
+
+    def _invalid_record(self, record: dict[str, object], errors: list[str]) -> dict[str, object]:
+        return {
+            **{column: self._string_value(record.get(column)) for column in EXPECTED_COLUMNS},
+            "source_row_number": self._source_row_number(record),
+            "validation_errors": "|".join(sorted(set(errors))),
+            "validated_at": self.generated_at,
+        }
+
+    def _invalid_record_with_extra_errors(self, record: dict[str, object], errors: list[str]) -> dict[str, object]:
+        if not errors:
+            return record
+        existing_errors = str(record.get("validation_errors", "")).split("|")
+        validation_errors = sorted(error for error in {*existing_errors, *errors} if error)
+        return {
+            **record,
+            "validation_errors": "|".join(validation_errors),
+        }
+
+    def _customer_bet_num(self, record: dict[str, object]) -> tuple[str, int] | None:
+        customer_id = self._string_value(record.get("customer_id"))
+        bet_num = self._int_value(record.get("bet_num"))
+        if customer_id == "" or bet_num is None:
+            return None
+        return (customer_id, bet_num)
+
+    def _source_row_number(self, record: dict[str, object]) -> int:
+        value = record.get(SOURCE_ROW_NUMBER)
+        if value is None:
+            value = record.get("source_row_number")
+        parsed_value = self._int_value(value)
+        if parsed_value is None:
+            return -1
+        return parsed_value
+
+    def _int_value(self, value: object) -> int | None:
+        try:
+            return int(str(value))
+        except (TypeError, ValueError):
+            return None
+
+    def _string_value(self, value: object) -> str:
+        if value is None:
+            return ""
+        return str(value)
+
+
 class BetValidationRowBatchWorker:
     """Validate one source row batch."""
 
@@ -256,6 +374,132 @@ class BetValidationRowBatchWorker:
         return rows_with_source
 
 
+class ValidationSequenceFinalizer:
+    """Enforce customer bet-number sequence after customer-complete partitioning."""
+
+    def __init__(self, generated_at: str) -> None:
+        self.generated_at = datetime.fromisoformat(generated_at).astimezone(timezone.utc)
+
+    def finalize(
+        self,
+        partition_paths: list[Path],
+        invalid_partition_paths: list[Path],
+    ) -> ValidationSequenceFinalizationResult:
+        demoted_valid_rows = 0
+        failure_counts: Counter[str] = Counter()
+
+        for valid_path, invalid_path in zip(partition_paths, invalid_partition_paths, strict=True):
+            _, valid_rows = read_parquet(valid_path)
+            _, invalid_rows = read_parquet(invalid_path)
+            affected_customers = self._customers_with_sequence_gaps(valid_rows, invalid_rows)
+            if not affected_customers:
+                continue
+
+            retained_valid_rows, demoted_invalid_rows = self._demote_valid_rows(valid_rows, affected_customers)
+            updated_invalid_rows, existing_invalid_sequence_errors = self._invalid_rows_with_sequence_errors(
+                invalid_rows, affected_customers
+            )
+            updated_invalid_rows.extend(demoted_invalid_rows)
+            updated_invalid_rows = sorted(updated_invalid_rows, key=self._source_row_number)
+
+            demoted_valid_rows += len(demoted_invalid_rows)
+            failure_counts.update(
+                {"customer_bet_num_sequence": len(demoted_invalid_rows) + existing_invalid_sequence_errors}
+            )
+
+            write_parquet(valid_path, retained_valid_rows, VALID_BETS_SCHEMA)
+            write_parquet(invalid_path, updated_invalid_rows, INVALID_BETS_SCHEMA)
+
+        return ValidationSequenceFinalizationResult(
+            demoted_valid_rows=demoted_valid_rows,
+            failure_counts_by_rule=dict(sorted(failure_counts.items())),
+        )
+
+    def _customers_with_sequence_gaps(
+        self, valid_rows: list[dict[str, object]], invalid_rows: list[dict[str, object]]
+    ) -> set[str]:
+        customer_bet_nums: dict[str, set[int]] = {}
+        for row in [*valid_rows, *invalid_rows]:
+            customer_id = self._string_value(row.get("customer_id"))
+            bet_num = self._int_value(row.get("bet_num"))
+            if customer_id and bet_num is not None and bet_num > 0:
+                customer_bet_nums.setdefault(customer_id, set()).add(bet_num)
+
+        affected_customers = set()
+        for customer_id, bet_nums in customer_bet_nums.items():
+            ordered_bet_nums = sorted(bet_nums)
+            expected_bet_nums = list(range(1, ordered_bet_nums[-1] + 1))
+            if ordered_bet_nums != expected_bet_nums:
+                affected_customers.add(customer_id)
+        return affected_customers
+
+    def _demote_valid_rows(
+        self,
+        valid_rows: list[dict[str, object]],
+        affected_customers: set[str],
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        retained_valid_rows = []
+        demoted_invalid_rows = []
+        for row in valid_rows:
+            if self._string_value(row.get("customer_id")) in affected_customers:
+                demoted_invalid_rows.append(self._invalid_record(row))
+            else:
+                retained_valid_rows.append(row)
+        return retained_valid_rows, demoted_invalid_rows
+
+    def _invalid_rows_with_sequence_errors(
+        self,
+        invalid_rows: list[dict[str, object]],
+        affected_customers: set[str],
+    ) -> tuple[list[dict[str, object]], int]:
+        updated_rows = []
+        added_errors = 0
+        for row in invalid_rows:
+            bet_num = self._int_value(row.get("bet_num"))
+            if self._string_value(row.get("customer_id")) in affected_customers and bet_num is not None and bet_num > 0:
+                updated_row, added_error = self._invalid_record_with_sequence_error(row)
+                updated_rows.append(updated_row)
+                added_errors += int(added_error)
+            else:
+                updated_rows.append(row)
+        return updated_rows, added_errors
+
+    def _invalid_record(self, record: dict[str, object]) -> dict[str, object]:
+        return {
+            **{column: self._string_value(record.get(column)) for column in EXPECTED_COLUMNS},
+            "source_row_number": self._source_row_number(record),
+            "validation_errors": "customer_bet_num_sequence",
+            "validated_at": self.generated_at,
+        }
+
+    def _invalid_record_with_sequence_error(self, record: dict[str, object]) -> tuple[dict[str, object], bool]:
+        errors = set(str(record.get("validation_errors", "")).split("|"))
+        already_present = "customer_bet_num_sequence" in errors
+        errors.add("customer_bet_num_sequence")
+        return {
+            **record,
+            "validation_errors": "|".join(sorted(error for error in errors if error)),
+        }, not already_present
+
+    def _source_row_number(self, record: dict[str, object]) -> int:
+        value = record.get("source_row_number")
+        parsed_value = self._int_value(value)
+        if parsed_value is None:
+            return -1
+        return parsed_value
+
+    def _int_value(self, value: object) -> int | None:
+        try:
+            return int(str(value))
+        except (TypeError, ValueError):
+            return None
+
+    def _string_value(self, value: object) -> str:
+        if value is None:
+            return ""
+        return str(value)
+
+
 class BetValidationBatchProcess:
     """Orchestrate validation over source row batches."""
 
@@ -283,6 +527,7 @@ class BetValidationBatchProcess:
         invalid_rows = 0
         failure_counts: Counter[str] = Counter()
         batches_processed = 0
+        global_state = StreamingValidationState(generated_at)
 
         with ExitStack() as stack:
             writers = ValidationPartitionWriters(stack, validation_dir)
@@ -293,7 +538,8 @@ class BetValidationBatchProcess:
                 settings.validation_worker_count,
                 generated_at,
             )
-            for result in validation_results:
+            for row_batch_result in validation_results:
+                result = global_state.apply(row_batch_result)
                 batches_processed += 1
                 total_rows += result.total_rows
                 valid_rows += result.valid_rows
@@ -304,6 +550,11 @@ class BetValidationBatchProcess:
             writers.ensure_partition_files(router.partition_count)
             partition_paths = writers.valid_partition_paths(router.partition_count)
             invalid_partition_paths = writers.invalid_partition_paths(router.partition_count)
+
+        sequence_result = ValidationSequenceFinalizer(generated_at).finalize(partition_paths, invalid_partition_paths)
+        valid_rows -= sequence_result.demoted_valid_rows
+        invalid_rows += sequence_result.demoted_valid_rows
+        failure_counts.update(sequence_result.failure_counts_by_rule)
 
         return PartitionedInput(
             fieldnames=fieldnames,
@@ -542,12 +793,14 @@ class BetFeaturePartitionWorker:
         write_parquet(
             self._partition_file(self.config.features_dir, "customer_features"),
             feature_rows,
-            CUSTOMER_FEATURES_SCHEMA,
+            customer_features_schema(self.feature_builder.window_datetime_column),
         )
         return FeatureBatchResult(
             feature_count=len(feature_rows),
             incomplete_first_n_count=self._incomplete_first_n_count(feature_rows),
             first_n_bets=self.config.first_n_bets,
+            feature_columns=tuple(self.feature_builder.feature_columns),
+            window_datetime_column=self.feature_builder.window_datetime_column,
         )
 
     def _partition_file(self, root_dir: Path, dataset_name: str) -> Path:
@@ -589,7 +842,14 @@ class BetFeatureBatchProcess:
             feature_count += feature_result.feature_count
             incomplete_first_n_count += feature_result.incomplete_first_n_count
 
-        return FeatureBatchResult(feature_count, incomplete_first_n_count, first_n_bets, feature_worker_count)
+        return FeatureBatchResult(
+            feature_count=feature_count,
+            incomplete_first_n_count=incomplete_first_n_count,
+            first_n_bets=first_n_bets,
+            feature_columns=feature_columns_for_window(first_n_bets),
+            window_datetime_column=window_datetime_column(first_n_bets),
+            feature_worker_count=feature_worker_count,
+        )
 
     def _feature_results(
         self,
@@ -710,7 +970,8 @@ class RunArtifactPublisher:
                 "run_id": self.run_id,
                 "generated_at": self.feature_generated_at.isoformat(timespec="seconds"),
                 "feature_set_version": FEATURE_SET_VERSION,
-                "feature_columns": list(FEATURE_COLUMNS),
+                "feature_columns": list(feature_result.feature_columns),
+                "window_datetime_column": feature_result.window_datetime_column,
                 "customers": feature_result.feature_count,
                 "customers_with_incomplete_first_n": feature_result.incomplete_first_n_count,
                 "first_n_bets": feature_result.first_n_bets,
@@ -778,10 +1039,14 @@ class RunArtifactPublisher:
         feature_count = 0
         incomplete_first_n_count = 0
         first_n_bets = None
+        feature_columns: list[str] = []
+        feature_window_datetime_column = None
         if feature_result is not None:
             feature_count = feature_result.feature_count
             incomplete_first_n_count = feature_result.incomplete_first_n_count
             first_n_bets = feature_result.first_n_bets
+            feature_columns = list(feature_result.feature_columns)
+            feature_window_datetime_column = feature_result.window_datetime_column
             feature_worker_count = feature_result.feature_worker_count
         else:
             feature_worker_count = None
@@ -809,6 +1074,8 @@ class RunArtifactPublisher:
                 "customers": feature_count,
                 "customers_with_incomplete_first_n": incomplete_first_n_count,
                 "first_n_bets": first_n_bets,
+                "feature_columns": feature_columns,
+                "window_datetime_column": feature_window_datetime_column,
                 "feature_worker_count": feature_worker_count,
                 "batch_size": partitioned_input.batch_size,
                 "feature_partition_count": partitioned_input.feature_partition_count,

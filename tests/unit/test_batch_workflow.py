@@ -90,6 +90,98 @@ class BatchWorkflowTests(unittest.TestCase):
             self.assertTrue((run_dir / "validation" / "valid_bets" / "part-00000.parquet").exists())
             self.assertFalse((output_dir / "_staging" / "validation-batch-test").exists())
 
+    def test_validation_batch_quarantines_later_global_duplicates(self) -> None:
+        rows = [
+            _row("1", "1"),
+            _row("1", "2"),
+            _row("3", "1"),
+        ]
+
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_path = tmp_path / "bets.csv"
+            write_csv(input_path, rows, EXPECTED_COLUMNS)
+
+            partitioned_input = BetValidationBatchProcess().process(
+                input_path,
+                tmp_path / "validation",
+                ValidationBatchSettings(batch_size=1),
+            )
+            invalid_rows = []
+            for partition_path in partitioned_input.invalid_partition_paths:
+                _, partition_rows = read_parquet(partition_path)
+                invalid_rows.extend(partition_rows)
+
+            self.assertEqual(partitioned_input.valid_rows, 1)
+            self.assertEqual(partitioned_input.invalid_rows, 2)
+            self.assertEqual(partitioned_input.failure_counts_by_rule["bet_id_unique"], 1)
+            self.assertEqual(partitioned_input.failure_counts_by_rule["customer_bet_num_unique"], 1)
+            self.assertEqual(
+                sorted(row["validation_errors"] for row in invalid_rows),
+                ["bet_id_unique", "customer_bet_num_unique"],
+            )
+
+    def test_validation_batch_demotes_customer_rows_with_sequence_gap_after_partitioning(self) -> None:
+        rows = [
+            _row("1", "1"),
+            _row("3", "3"),
+        ]
+
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_path = tmp_path / "bets.csv"
+            write_csv(input_path, rows, EXPECTED_COLUMNS)
+
+            partitioned_input = BetValidationBatchProcess().process(
+                input_path,
+                tmp_path / "validation",
+                ValidationBatchSettings(batch_size=1),
+            )
+            valid_rows = []
+            invalid_rows = []
+            for partition_path in partitioned_input.partition_paths:
+                _, partition_rows = read_parquet(partition_path)
+                valid_rows.extend(partition_rows)
+            for partition_path in partitioned_input.invalid_partition_paths:
+                _, partition_rows = read_parquet(partition_path)
+                invalid_rows.extend(partition_rows)
+
+            self.assertEqual(partitioned_input.valid_rows, 0)
+            self.assertEqual(partitioned_input.invalid_rows, 2)
+            self.assertEqual(partitioned_input.failure_counts_by_rule["customer_bet_num_sequence"], 2)
+            self.assertEqual(valid_rows, [])
+            self.assertEqual(sorted(row["bet_id"] for row in invalid_rows), ["1", "3"])
+            self.assertEqual({row["validation_errors"] for row in invalid_rows}, {"customer_bet_num_sequence"})
+            self.assertEqual(sorted(row["source_row_number"] for row in invalid_rows), [2, 3])
+
+    def test_invalid_row_inside_sequence_does_not_create_sequence_gap(self) -> None:
+        rows = [
+            _row("1", "1"),
+            _row("2", "2", amount="-1"),
+            _row("3", "3"),
+        ]
+
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            input_path = tmp_path / "bets.csv"
+            write_csv(input_path, rows, EXPECTED_COLUMNS)
+
+            partitioned_input = BetValidationBatchProcess().process(
+                input_path,
+                tmp_path / "validation",
+                ValidationBatchSettings(batch_size=1),
+            )
+            invalid_rows = []
+            for partition_path in partitioned_input.invalid_partition_paths:
+                _, partition_rows = read_parquet(partition_path)
+                invalid_rows.extend(partition_rows)
+
+            self.assertEqual(partitioned_input.valid_rows, 2)
+            self.assertEqual(partitioned_input.invalid_rows, 1)
+            self.assertNotIn("customer_bet_num_sequence", partitioned_input.failure_counts_by_rule)
+            self.assertEqual(invalid_rows[0]["bet_id"], "2")
+            self.assertEqual(invalid_rows[0]["validation_errors"], "betting_amount_gt_0")
+
     def test_feature_batch_writes_manifest_validation_and_features(self) -> None:
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

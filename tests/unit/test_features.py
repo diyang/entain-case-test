@@ -61,7 +61,8 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual(feature["bets_used"], 20)
         self.assertEqual(feature["total_betting_amount"], 200.0)
         self.assertEqual(feature["mean_betting_amount"], 10.0)
-        self.assertEqual(feature["nth_bet_datetime"].isoformat(), "2024-08-20T00:00:00")
+        self.assertEqual(feature["bet_20_datetime"].isoformat(), "2024-08-20T00:00:00")
+        self.assertNotIn("nth_bet_datetime", feature)
 
     def test_customer_features_can_use_configured_first_n_bet_numbers(self) -> None:
         rows = [_row(i, "10") for i in range(1, 13)]
@@ -71,7 +72,8 @@ class FeatureTests(unittest.TestCase):
 
         self.assertEqual(features[0]["bets_used"], 10)
         self.assertEqual(features[0]["total_betting_amount"], 100.0)
-        self.assertEqual(features[0]["nth_bet_datetime"].isoformat(), "2024-08-10T00:00:00")
+        self.assertEqual(features[0]["bet_10_datetime"].isoformat(), "2024-08-10T00:00:00")
+        self.assertNotIn("bet_20_datetime", features[0])
 
     def test_customer_percentages_are_computed(self) -> None:
         rows = [
@@ -149,7 +151,7 @@ class FeatureTests(unittest.TestCase):
             self.assertEqual(features[0]["bets_used"], 20)
             self.assertEqual(features[0]["total_betting_amount"], 200.0)
             self.assertEqual(features[0]["first_bet_datetime"].isoformat(), "2024-08-01T00:00:00")
-            self.assertEqual(features[0]["nth_bet_datetime"].isoformat(), "2024-08-20T00:00:00")
+            self.assertEqual(features[0]["bet_20_datetime"].isoformat(), "2024-08-20T00:00:00")
 
     def test_feature_batch_process_accepts_first_n_bets_argument(self) -> None:
         rows = [_row(i, "10") for i in range(1, 13)]
@@ -180,8 +182,10 @@ class FeatureTests(unittest.TestCase):
 
             self.assertEqual(feature_result.first_n_bets, 10)
             self.assertEqual(manifest["features"]["first_n_bets"], 10)
+            self.assertEqual(manifest["features"]["window_datetime_column"], "bet_10_datetime")
             self.assertEqual(features[0]["bets_used"], 10)
             self.assertEqual(features[0]["total_betting_amount"], 100.0)
+            self.assertEqual(features[0]["bet_10_datetime"].isoformat(), "2024-08-10T00:00:00")
 
     def test_file_processor_excludes_invalid_rows_before_feature_building(self) -> None:
         rows = [_row(1, "10"), _row(2, "-5")]
@@ -260,7 +264,7 @@ class FeatureTests(unittest.TestCase):
 
             self.assertEqual(features[0]["bets_used"], 19)
             self.assertEqual(features[0]["total_betting_amount"], 190.0)
-            self.assertEqual(features[0]["nth_bet_datetime"].isoformat(), "2024-08-20T00:00:00")
+            self.assertEqual(features[0]["bet_20_datetime"].isoformat(), "2024-08-20T00:00:00")
             self.assertEqual(manifest["features"]["customers_with_incomplete_first_n"], 1)
             self.assertEqual(feature_report["customers_with_incomplete_first_n"], 1)
 

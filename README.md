@@ -201,7 +201,7 @@ The second Docker command skips raw CSV validation and reads `/outputs/runs/001/
 
 The batch validation job checks required columns, integer `bet_id`, UUID `customer_id`, parseable `bet_datetime`, positive `bet_num`, numeric parsing, business domains, `betting_amount`, `price`, `payout`, and `return_for_entain`.
 
-It also checks the required payout and `return_for_entain` formulas. The local row-batch validation path does not hold full-file state for global `bet_id` uniqueness or full customer bet-number sequence checks; those should be enforced by a table-level quality check in a larger production platform. The in-memory `BetValidator.validate` method supports those checks for bounded inputs and unit-level validation.
+It also checks the required payout and `return_for_entain` formulas. While validation streams through row batches, it keeps a small uniqueness index so later duplicate `bet_id` values and later duplicate `(customer_id, bet_num)` values are quarantined instead of entering `valid_bets`. After customer-complete partition files are written, the validation stage runs a partition-level sequence finalizer. If the raw observed bet numbers for a customer have a gap, such as `1, 2, 4`, all valid rows for that affected customer are demoted into `invalid_bets` with `customer_bet_num_sequence`. The finalizer reads one customer-complete partition at a time, so it enforces the sequence rule without loading the full CSV into memory.
 
 Invalid rows are written to parquet quarantine with `source_row_number`, `validation_errors`, and `validated_at`. Failure counts are also written to `validation_report.json`.
 
@@ -214,7 +214,7 @@ The selected features summarize early customer betting behavior:
 | Feature | Aggregation | Why it is useful |
 | --- | --- | --- |
 | `first_bet_datetime` | Timestamp from the lowest valid `bet_num` in the first-N window | Gives the start of the observed customer history and supports time-based joins or cohorting. |
-| `nth_bet_datetime` | Timestamp where `bet_num == first_n_bets`, when present | Shows whether the customer reached the full first-N window and when that early window completed. |
+| `bet_<N>_datetime` | Timestamp where `bet_num == first_n_bets`, when present | Shows whether the customer reached the configured first-N window. With the default `--first-n-bets 20`, this is `bet_20_datetime`; with `--first-n-bets 10`, this is `bet_10_datetime`. |
 | `bets_used` | Count of valid bets used in the first-N window | Makes missing or invalid first-N records visible to downstream models. |
 | `total_betting_amount` | Sum of `betting_amount` | Captures early customer stake volume. |
 | `mean_betting_amount` | Average `betting_amount` | Captures typical stake size without letting customers with more available valid rows dominate only through volume. |
@@ -236,7 +236,8 @@ The pipeline treats `bet_num` as the authoritative order. The default feature wi
 2. Feature generation continues for that customer using the remaining valid records where `bet_num <= first_n_bets`.
 3. Later valid bets, such as `bet_num == first_n_bets + 1`, are not pulled forward to replace invalid records inside the feature window.
 4. The feature row shows the effect through `bets_used`; it can be less than `first_n_bets`.
-5. `nth_bet_datetime` is only populated when the valid `bet_num == first_n_bets` row exists.
-6. `feature_report.json` and `run_manifest.json` include `customers_with_incomplete_first_n` so operators can see how often this happened.
+5. The window datetime column is only populated when the valid `bet_num == first_n_bets` row exists.
+6. The window datetime column name follows the configured window: default `--first-n-bets 20` writes `bet_20_datetime`; `--first-n-bets 10` writes `bet_10_datetime`.
+7. `feature_report.json` and `run_manifest.json` include `customers_with_incomplete_first_n` so operators can see how often this happened.
 
 This keeps the feature window deterministic for the same source data and avoids silently changing the definition of the first-N window.

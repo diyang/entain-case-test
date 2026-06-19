@@ -342,6 +342,7 @@ class BetValidator:
             "bet_result": row["bet_result"],
             "payout": float(row["payout"]),
             "return_for_entain": float(row["return_for_entain"]),
+            "source_row_number": self._source_row_number(row, -1),
         }
 
     def _typed_invalid_row(

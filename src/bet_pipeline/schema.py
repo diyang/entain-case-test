@@ -36,6 +36,7 @@ VALID_BETS_SCHEMA = pa.schema(
         ("bet_result", pa.string()),
         ("payout", pa.float64()),
         ("return_for_entain", pa.float64()),
+        ("source_row_number", pa.int64()),
     ]
 )
 
@@ -58,20 +59,25 @@ INVALID_BETS_SCHEMA = pa.schema(
     ]
 )
 
-CUSTOMER_FEATURES_SCHEMA = pa.schema(
-    [
-        ("customer_id", pa.string()),
-        ("first_bet_datetime", pa.timestamp("us")),
-        ("nth_bet_datetime", pa.timestamp("us")),
-        ("bets_used", pa.int64()),
-        ("total_betting_amount", pa.float64()),
-        ("mean_betting_amount", pa.float64()),
-        ("mean_price", pa.float64()),
-        ("pct_racing", pa.float64()),
-        ("pct_cash", pa.float64()),
-        ("pct_return", pa.float64()),
-        ("total_payout", pa.float64()),
-        ("total_return_for_entain", pa.float64()),
-        ("feature_generated_at", pa.timestamp("us", tz="UTC")),
-    ]
-)
+
+def customer_features_schema(window_datetime_column: str) -> pa.Schema:
+    return pa.schema(
+        [
+            ("customer_id", pa.string()),
+            ("first_bet_datetime", pa.timestamp("us")),
+            (window_datetime_column, pa.timestamp("us")),
+            ("bets_used", pa.int64()),
+            ("total_betting_amount", pa.float64()),
+            ("mean_betting_amount", pa.float64()),
+            ("mean_price", pa.float64()),
+            ("pct_racing", pa.float64()),
+            ("pct_cash", pa.float64()),
+            ("pct_return", pa.float64()),
+            ("total_payout", pa.float64()),
+            ("total_return_for_entain", pa.float64()),
+            ("feature_generated_at", pa.timestamp("us", tz="UTC")),
+        ]
+    )
+
+
+CUSTOMER_FEATURES_SCHEMA = customer_features_schema("bet_20_datetime")

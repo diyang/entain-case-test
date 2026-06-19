@@ -82,10 +82,12 @@ Validation enforces the row-level rules from the task:
 - payout formula by `bet_result` and `stake_type`
 - `return_for_entain` formula by `bet_result` and `stake_type`
 - parseable identifiers, timestamps, and numeric values
+- duplicate `bet_id` values across validation row batches
+- duplicate `(customer_id, bet_num)` values across validation row batches
 
 Curated outputs use explicit Arrow schemas from `schema.py`. Validation reports include `schema_version`; feature reports include `feature_set_version`, `feature_columns`, and `first_n_bets`. Breaking schema or feature changes should create a new version instead of changing existing semantics in place.
 
-The local row-batch validation path does not hold full-file state for global checks such as complete `bet_id` uniqueness or full customer bet-number sequence validation. In a larger production platform, those constraints should be handled by a distributed table-quality check before publishing.
+The local row-batch validation path keeps streaming uniqueness state, so later duplicates are quarantined before partition writes. After customer-complete partition files are written, a partition-level sequence finalizer checks the raw observed `bet_num` sequence for each customer using both valid and invalid rows in that partition. If a customer's raw sequence has a gap, such as `1, 2, 4`, valid rows for that affected customer are demoted into `invalid_bets` with `customer_bet_num_sequence` before the run is published. The finalizer reads one customer-complete partition at a time, so it enforces the rule without loading the full source file into memory.
 
 ## Invalid Records
 
@@ -99,8 +101,9 @@ If invalid rows appear inside a customer's first-N window, behavior is determini
 2. Feature generation uses only valid rows where `bet_num <= first_n_bets`.
 3. Later valid bets are not pulled forward to fill gaps.
 4. `bets_used` can be less than `first_n_bets`.
-5. `nth_bet_datetime` is present only when the valid `bet_num == first_n_bets` row exists.
-6. `customers_with_incomplete_first_n` is reported.
+5. The window datetime column is present only when the valid `bet_num == first_n_bets` row exists.
+6. The window datetime column name follows the configured window: default `first_n_bets = 20` writes `bet_20_datetime`; `first_n_bets = 10` writes `bet_10_datetime`.
+7. `customers_with_incomplete_first_n` is reported.
 
 This avoids inventing or interpolating financial outcomes.
 
@@ -110,7 +113,7 @@ The feature output has one row per `customer_id`. It is built from validated row
 
 | Feature group | Fields | Why it is useful |
 | --- | --- | --- |
-| Window lineage | `first_bet_datetime`, `nth_bet_datetime`, `bets_used`, `feature_generated_at` | Shows whether the early customer window is complete and when features were produced. |
+| Window lineage | `first_bet_datetime`, `bet_<N>_datetime`, `bets_used`, `feature_generated_at` | Shows whether the configured first-N window is complete and when features were produced. With the default first-N value, the dynamic column is `bet_20_datetime`; for first 10 it is `bet_10_datetime`. |
 | Stake behavior | `total_betting_amount`, `mean_betting_amount` | Captures early stake volume and typical stake size. |
 | Price behavior | `mean_price` | Summarizes early odds profile, which can proxy for betting style or risk preference. |
 | Product and funding mix | `pct_racing`, `pct_cash` | Converts categorical behavior into stable numeric features for model consumers. |

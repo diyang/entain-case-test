@@ -30,7 +30,7 @@ dev = [
 ]
 
 [project.scripts]
-bet-pipeline = "bet_pipeline.cli:main"
+bet-pipeline = "bet_pipeline.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

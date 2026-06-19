@@ -3,7 +3,7 @@ from __future__ import annotations
 import pyarrow as pa
 
 SCHEMA_VERSION = "bets-v1"
-FEATURE_SET_VERSION = "customer-first-20-v1"
+FEATURE_SET_VERSION = "customer-first-n-v1"
 
 EXPECTED_COLUMNS = (
     "bet_id",
@@ -62,7 +62,7 @@ CUSTOMER_FEATURES_SCHEMA = pa.schema(
     [
         ("customer_id", pa.string()),
         ("first_bet_datetime", pa.timestamp("us")),
-        ("twentieth_bet_datetime", pa.timestamp("us")),
+        ("nth_bet_datetime", pa.timestamp("us")),
         ("bets_used", pa.int64()),
         ("total_betting_amount", pa.float64()),
         ("mean_betting_amount", pa.float64()),

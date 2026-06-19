@@ -171,6 +171,29 @@ The validation job checks required columns, integer `bet_id`, UUID `customer_id`
 
 Invalid rows are written to parquet quarantine with `source_row_number`, `validation_errors`, and `validated_at`. Failure counts are also written to `validation_report.json`.
 
+## Customer Feature Dataset
+
+The feature output has one row per `customer_id`. It is built from validated rows only, using each customer's first N bets by authoritative `bet_num`; the default N is 20.
+
+The selected features summarize early customer betting behavior:
+
+| Feature | Aggregation | Why it is useful |
+| --- | --- | --- |
+| `first_bet_datetime` | Timestamp from the lowest valid `bet_num` in the first-N window | Gives the start of the observed customer history and supports time-based joins or cohorting. |
+| `nth_bet_datetime` | Timestamp where `bet_num == first_n_bets`, when present | Shows whether the customer reached the full first-N window and when that early window completed. |
+| `bets_used` | Count of valid bets used in the first-N window | Makes missing or invalid first-N records visible to downstream models. |
+| `total_betting_amount` | Sum of `betting_amount` | Captures early customer stake volume. |
+| `mean_betting_amount` | Average `betting_amount` | Captures typical stake size without letting customers with more available valid rows dominate only through volume. |
+| `mean_price` | Average decimal odds `price` | Summarizes early risk appetite or bet profile. |
+| `pct_racing` | Share of first-N bets where `category == racing` | Encodes product preference between racing and sports. |
+| `pct_cash` | Share of first-N bets where `stake_type == cash` | Distinguishes real-cash funded behavior from bonus-funded behavior. |
+| `pct_return` | Share of first-N bets where `bet_result == return` | Captures early win/return frequency. |
+| `total_payout` | Sum of validated `payout` | Captures customer cash-back outcome over the early window. |
+| `total_return_for_entain` | Sum of `return_for_entain` | Captures early customer profitability from Entain's perspective. |
+| `feature_generated_at` | Batch feature generation timestamp | Provides feature lineage and supports reproducibility checks. |
+
+These are deliberately simple, auditable aggregations. Sums capture total exposure and value, means normalize behavior across customers with different valid row counts, and percentages convert categorical behavior into stable numeric features that batch training, scoring, BI, CRM, or decisioning systems can consume.
+
 ## First-N Feature Policy
 
 The pipeline treats `bet_num` as the authoritative order. The default feature window is the first 20 bets, and it can be changed with `--first-n-bets`. If invalid records appear inside a customer's configured first-N window, the batch handles them as follows:

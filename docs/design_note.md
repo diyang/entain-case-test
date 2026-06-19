@@ -159,6 +159,18 @@ If invalid records appear inside a customer's first-N window, behavior is determ
 
 Feature definitions live in `BetFeatureBuilder` and are reported through `feature_set_version`, `feature_columns`, and `first_n_bets`. Consumers should rely on the parquet schema and feature report, not only file names.
 
+The customer-level feature row is intentionally compact and auditable. It uses the first-N validated bets by authoritative `bet_num` and produces:
+
+| Feature group | Fields | Reason |
+| --- | --- | --- |
+| Window lineage | `first_bet_datetime`, `nth_bet_datetime`, `bets_used`, `feature_generated_at` | Tells consumers what early window was observed, whether the full window was available, and when the feature row was produced. |
+| Stake behavior | `total_betting_amount`, `mean_betting_amount` | Captures both total early stake volume and typical stake size. |
+| Price behavior | `mean_price` | Summarizes early odds profile, which can proxy for risk preference or bet style. |
+| Product and funding mix | `pct_racing`, `pct_cash` | Converts categorical behavior into numeric model features for product preference and cash-versus-bonus usage. |
+| Outcome and value | `pct_return`, `total_payout`, `total_return_for_entain` | Captures early return frequency, customer payout experience, and value to Entain. |
+
+Sums are used where total exposure matters. Means are used where typical behavior should be comparable across customers with different valid-row counts. Percentages are used for categorical fields so downstream models and scoring jobs receive stable numeric inputs.
+
 Downstream systems should read only committed runs that contain `_SUCCESS`:
 
 - Batch training records `run_id`, schema version, and feature-set version with the model.

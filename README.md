@@ -157,6 +157,8 @@ The integration test uses `tests/integrate/fixtures/bets.csv`, not the full `dat
 
 ## Docker
 
+The Docker image installs dependencies with `uv sync --frozen` from `uv.lock`, so container builds use the locked dependency versions instead of resolving open ranges from `pyproject.toml`.
+
 Build:
 
 ```bash

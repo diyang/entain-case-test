@@ -50,6 +50,21 @@ flowchart TD
     invalid --> review --> rerun --> trigger
 ```
 
+## Production Control Plane
+
+```mermaid
+flowchart TD
+    batch["Collapsed main batch flow<br/>Bronze -> Silver -> Gold -> Publish"]
+
+    metadata["Metadata, schema, and configuration<br/>schemas, feature definitions, CLI/job config"]
+    logs["Run logs, reports, and metrics<br/>manifest, validation report, feature report"]
+    monitoring["Monitoring layer<br/>quality, freshness, completeness, runtime"]
+    alerting["Alerting layer<br/>failed run, high invalid rate, missing _SUCCESS"]
+
+    metadata --> batch
+    batch --> logs --> monitoring --> alerting
+```
+
 ## Validation Checkpoint Reuse
 
 ```mermaid

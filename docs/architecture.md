@@ -19,8 +19,8 @@ flowchart TD
     subgraph silver["Silver&nbsp;layer:&nbsp;Validated&nbsp;Bets&nbsp;and&nbsp;Invalid-Bet&nbsp;Quarantine"]
         direction TD
         validate["BetValidationPartitionWorker<br/>validate one raw partition"]
-        valid["valid_bets/part-*.parquet"]
-        invalid["invalid_bets/part-*.parquet"]
+        valid["valid_bets/part-*.parquet<br/>one customer stays in one partition"]
+        invalid["invalid_bets/part-*.parquet<br/>one customer stays in one partition"]
 
         validate --> valid
         validate --> invalid

@@ -1,11 +1,47 @@
 from __future__ import annotations
 
 import unittest
+from io import StringIO
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from bet_pipeline import main
 from bet_pipeline.batch import ValidationBatchSettings
+
+
+def _manifest() -> dict:
+    return {
+        "run_id": "run",
+        "status": "success",
+        "input_path": "data/bets.csv",
+        "started_at": "2024-01-01T00:00:00+00:00",
+        "finished_at": "2024-01-01T00:00:01+00:00",
+        "validation": {
+            "total_rows": 3,
+            "valid_rows": 2,
+            "invalid_rows": 1,
+            "batches_processed": 2,
+            "batch_size": 2,
+            "feature_partition_count": 1,
+            "failure_counts_by_rule": {"betting_amount_gt_0": 1},
+        },
+        "features": {
+            "customers": 1,
+            "customers_with_incomplete_first_n": 0,
+            "first_n_bets": 20,
+            "feature_partition_count": 1,
+            "feature_worker_count": 1,
+            "feature_dir": "outputs/runs/run/features/customer_features",
+        },
+        "outputs": {
+            "run_dir": "outputs/runs/run",
+            "valid_bets_dir": "outputs/runs/run/validation/valid_bets",
+            "invalid_bets_dir": "outputs/runs/run/validation/invalid_bets",
+            "manifest": "outputs/runs/run/run_manifest.json",
+            "success_marker": "outputs/runs/run/_SUCCESS",
+        },
+    }
 
 
 class MainTests(unittest.TestCase):
@@ -27,6 +63,7 @@ class MainTests(unittest.TestCase):
             validation_process = validation_process_class.return_value
             validation_process.process.return_value = partitioned_input
             run.write_validation_report.return_value = report
+            run.write_manifest.return_value = _manifest()
 
             exit_code = main.main(
                 [
@@ -43,7 +80,7 @@ class MainTests(unittest.TestCase):
             )
 
             self.assertEqual(exit_code, 0)
-            run_class.assert_called_once_with("outputs", None)
+            run_class.assert_called_once_with(Path("outputs"), None)
             validation_process.process.assert_called_once_with(
                 "data/bets.csv",
                 "outputs/_staging/run/validation",
@@ -77,22 +114,12 @@ class MainTests(unittest.TestCase):
                 "invalid_rows": 1,
             }
             feature_result = SimpleNamespace(feature_count=1, incomplete_first_n_count=0)
-            manifest = {
-                "run_id": "run-1",
-                "validation": {
-                    "valid_rows": 2,
-                    "invalid_rows": 1,
-                },
-                "features": {
-                    "customers": 1,
-                },
-            }
             validation_process = validation_process_class.return_value
             feature_process = feature_process_class.return_value
             validation_process.process.return_value = partitioned_input
             feature_process.process.return_value = feature_result
             run.write_validation_report.return_value = report
-            run.write_manifest.return_value = manifest
+            run.write_manifest.return_value = _manifest()
 
             exit_code = main.main(
                 [
@@ -115,7 +142,7 @@ class MainTests(unittest.TestCase):
             )
 
             self.assertEqual(exit_code, 0)
-            run_class.assert_called_once_with("outputs", "run-1")
+            run_class.assert_called_once_with(Path("outputs"), "run-1")
             validation_process.process.assert_called_once_with(
                 "data/bets.csv",
                 "outputs/_staging/run-1/validation",
@@ -156,15 +183,10 @@ class MainTests(unittest.TestCase):
             partitioned_input = SimpleNamespace()
             report = {"total_rows": 10, "valid_rows": 10, "invalid_rows": 0}
             feature_result = SimpleNamespace(feature_count=2, incomplete_first_n_count=0, first_n_bets=10)
-            manifest = {
-                "run_id": "run",
-                "validation": {"valid_rows": 10, "invalid_rows": 0},
-                "features": {"customers": 2},
-            }
             validation_process_class.return_value.process.return_value = partitioned_input
             feature_process_class.return_value.process.return_value = feature_result
             run.write_validation_report.return_value = report
-            run.write_manifest.return_value = manifest
+            run.write_manifest.return_value = _manifest()
 
             exit_code = main.main(
                 [
@@ -213,6 +235,7 @@ class MainTests(unittest.TestCase):
             report = {"total_rows": 10, "valid_rows": 10, "invalid_rows": 0}
             validation_process_class.return_value.process.return_value = partitioned_input
             run.write_validation_report.return_value = report
+            run.write_manifest.return_value = _manifest()
 
             exit_code = main.main(
                 [
@@ -241,6 +264,79 @@ class MainTests(unittest.TestCase):
             run.write_manifest.assert_called_once_with(partitioned_input, report)
             run.commit.assert_called_once_with(partitioned_input)
             feature_process_class.assert_not_called()
+
+    def test_build_features_normalizes_features_output_to_batch_root(self) -> None:
+        with (
+            patch("bet_pipeline.main.RunArtifactPublisher") as run_class,
+            patch("bet_pipeline.main.BetValidationBatchProcess") as validation_process_class,
+            patch("bet_pipeline.main.BetFeatureBatchProcess") as feature_process_class,
+        ):
+            run = run_class.return_value
+            run.validation_dir = "outputs/_staging/run/validation"
+            run.features_dir = "outputs/_staging/run/features"
+            run.validation_generated_at = "2024-01-01T00:00:00+00:00"
+            run.feature_generated_at = "2024-01-01T00:00:01+00:00"
+            partitioned_input = SimpleNamespace()
+            report = {"total_rows": 1, "valid_rows": 1, "invalid_rows": 0}
+            feature_result = SimpleNamespace(feature_count=1, incomplete_first_n_count=0)
+            validation_process_class.return_value.process.return_value = partitioned_input
+            feature_process_class.return_value.process.return_value = feature_result
+            run.write_validation_report.return_value = report
+            run.write_manifest.return_value = _manifest()
+
+            exit_code = main.main(
+                [
+                    "build-features",
+                    "--input",
+                    "data/bets.csv",
+                    "--output",
+                    "outputs/features",
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            run_class.assert_called_once_with(Path("outputs"), None)
+
+    def test_validate_normalizes_validation_output_to_batch_root(self) -> None:
+        with (
+            patch("bet_pipeline.main.RunArtifactPublisher") as run_class,
+            patch("bet_pipeline.main.BetValidationBatchProcess") as validation_process_class,
+            patch("bet_pipeline.main.BetFeatureBatchProcess"),
+        ):
+            run = run_class.return_value
+            run.validation_dir = "outputs/_staging/run/validation"
+            run.validation_generated_at = "2024-01-01T00:00:00+00:00"
+            partitioned_input = SimpleNamespace()
+            report = {"total_rows": 1, "valid_rows": 1, "invalid_rows": 0}
+            validation_process_class.return_value.process.return_value = partitioned_input
+            run.write_validation_report.return_value = report
+            run.write_manifest.return_value = _manifest()
+
+            exit_code = main.main(
+                [
+                    "validate",
+                    "--input",
+                    "data/bets.csv",
+                    "--output",
+                    "outputs/validation",
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            run_class.assert_called_once_with(Path("outputs"), None)
+
+    def test_run_summary_printer_outputs_operational_metrics(self) -> None:
+        stream = StringIO()
+        main.RunSummaryPrinter(stream).print_feature_summary(_manifest())
+
+        output = stream.getvalue()
+        self.assertIn("Batch run completed", output)
+        self.assertIn("run_id: run", output)
+        self.assertIn("rows: 3 total, 2 valid, 1 invalid (33.33% invalid)", output)
+        self.assertIn("validation_failures:", output)
+        self.assertIn("betting_amount_gt_0: 1", output)
+        self.assertIn("customers: 1", output)
+        self.assertIn("customer_features: outputs/runs/run/features/customer_features", output)
 
 
 if __name__ == "__main__":

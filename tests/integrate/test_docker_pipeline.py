@@ -27,6 +27,7 @@ class TestDockerPipelineIntegration:
 
         assert (run_dir / "_SUCCESS").is_file()
         assert not staging_dir.exists()
+        assert not (output_dir / "features" / "runs" / run_id).exists()
         assert (run_dir / "run_manifest.json").is_file()
         assert (validation_dir / "validation_report.json").is_file()
         assert (features_dir / "feature_report.json").is_file()
@@ -89,6 +90,7 @@ class TestDockerPipelineIntegration:
         assert failed_run.returncode != 0
         assert not (output_dir / "runs" / failed_run_id).exists()
         assert not (output_dir / "_staging" / failed_run_id).exists()
+        assert not (output_dir / "features" / "runs" / failed_run_id).exists()
 
     def _output_dir(self, tmp_path: Path) -> Path:
         configured_output_dir = os.environ.get("OUTPUT_DIR")
@@ -112,7 +114,7 @@ class TestDockerPipelineIntegration:
             "--input",
             "/data/bets.csv",
             "--output",
-            "/outputs",
+            "/outputs/features",
             "--run-id",
             run_id,
             "--batch-size",

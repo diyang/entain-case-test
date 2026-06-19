@@ -153,7 +153,7 @@ Validate only:
 docker run --rm \
   -v $(pwd)/data:/data \
   -v $(pwd)/outputs:/outputs \
-  entain-bet-pipeline validate --input /data/bets.csv --output /outputs/validation/
+  entain-bet-pipeline validate --input /data/bets.csv --output /outputs/
 ```
 
 Feature batch:
@@ -162,7 +162,7 @@ Feature batch:
 docker run --rm \
   -v $(pwd)/data:/data \
   -v $(pwd)/outputs:/outputs \
-  entain-bet-pipeline build-features --input /data/bets.csv --output /outputs/features/
+  entain-bet-pipeline build-features --input /data/bets.csv --output /outputs/
 ```
 
 ## Validation Rules

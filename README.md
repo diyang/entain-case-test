@@ -79,7 +79,7 @@ Validate raw bets only:
 uv run bet-pipeline validate --input data/bets.csv --output outputs/ --run-id local-001
 ```
 
-Feature engineering is a batch phase inside the public `build-features` command. `RunArtifactPublisher` owns staging, reports, manifest, and commit. During source validation, `BetValidationBatchProcess` reads the CSV in row batches and creates a `BetValidationRowBatchWorker` for each row batch. Each worker applies row-level validation immediately. The validation process then routes valid and invalid rows through `FeaturePartitionRouter` and writes customer-complete parquet partitions in source-row-batch order. For feature runs, `BetFeatureBatchProcess` iterates feature partitions and creates a `BetFeaturePartitionWorker` for each partition to build and write features.
+Feature engineering is a batch phase inside the public `build-features` command. `RunArtifactPublisher` owns staging, reports, manifest, and commit. During source validation, `BetValidationBatchProcess` reads the CSV in row batches and creates a `BetValidationRowBatchWorker` for each row batch. Each worker applies row-level validation immediately. The validation process then routes valid and invalid rows through customer-complete partition routing and writes parquet partitions in source-row-batch order. For feature runs, `BetFeatureBatchProcess` iterates feature partitions and creates a `BetFeaturePartitionWorker` for each partition to build and write features.
 
 `--batch-size` controls how many source rows are read and validated at a time. It is not a feature boundary. `--validation-workers` defaults to 1 and can be increased for concurrent row-batch validation; partition routing and parquet writes are still coordinated in source-row-batch order to keep output deterministic. `--feature-workers` defaults to 1 and can be increased for concurrent customer-complete feature partition processing; each worker writes a distinct `customer_features/part-*.parquet` file. `--target-feature-partition-rows` is the main sizing input for feature partitions and defaults to the same row-count constant as `--batch-size` (`DEFAULT_BATCH_ROWS = 1000`), so validation row batches and feature partitions are roughly aligned by default. If you change `--batch-size` and want feature partitions to track it, set `--target-feature-partition-rows` to the same value. `--feature-partition-count` controls the exact number of customer-hash feature partitions and overrides the dynamic target. All rows for the same `customer_id` go to the same partition, so customer features are not split across row batches. `--first-n-bets` controls the feature window size and defaults to 20 for the interview task.
 
@@ -167,7 +167,9 @@ docker run --rm \
 
 ## Validation Rules
 
-The validation job checks required columns, integer `bet_id`, UUID `customer_id`, parseable `bet_datetime`, uniqueness of `bet_id`, per-customer uniqueness, positivity, and sequence of `bet_num`, numeric parsing, business domains, `payout`, and `return_for_entain`.
+The batch validation job checks required columns, integer `bet_id`, UUID `customer_id`, parseable `bet_datetime`, positive `bet_num`, numeric parsing, business domains, `betting_amount`, `price`, `payout`, and `return_for_entain`.
+
+It also checks the required payout and `return_for_entain` formulas. The local row-batch validation path does not hold full-file state for global `bet_id` uniqueness or full customer bet-number sequence checks; those should be enforced by a table-level quality check in a larger production platform. The in-memory `BetValidator.validate` method supports those checks for bounded inputs and unit-level validation.
 
 Invalid rows are written to parquet quarantine with `source_row_number`, `validation_errors`, and `validated_at`. Failure counts are also written to `validation_report.json`.
 

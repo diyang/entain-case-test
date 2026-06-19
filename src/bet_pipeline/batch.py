@@ -155,8 +155,8 @@ class ValidationPartitionWriters:
         return self.invalid_writers[partition_index]
 
 
-class FeaturePartitionRouter:
-    """Assign customer ids to feature partitions during the validation pass."""
+class CustomerPartitionRouter:
+    """Assign customer ids to customer-complete partitions during validation."""
 
     def __init__(self, feature_partition_count: int | None, target_partition_rows: int) -> None:
         if feature_partition_count is not None and feature_partition_count < 1:
@@ -265,7 +265,7 @@ class BetValidationBatchProcess:
             raise ValueError("validation_worker_count must be greater than 0")
 
         fieldnames = read_csv_fieldnames(input_path)
-        router = FeaturePartitionRouter(settings.feature_partition_count, settings.target_feature_partition_rows)
+        router = CustomerPartitionRouter(settings.feature_partition_count, settings.target_feature_partition_rows)
         generated_at = settings.generated_at
         if generated_at is None:
             generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -385,7 +385,7 @@ class BetValidationBatchProcess:
     def _write_partitions(
         self,
         result: ValidationRowBatchResult,
-        router: FeaturePartitionRouter,
+        router: CustomerPartitionRouter,
         writers: ValidationPartitionWriters,
     ) -> None:
         valid_partition_rows, invalid_partition_rows = self._partition_rows(
@@ -402,7 +402,7 @@ class BetValidationBatchProcess:
         self,
         valid_rows: list[dict[str, object]],
         invalid_rows: list[dict[str, object]],
-        router: FeaturePartitionRouter,
+        router: CustomerPartitionRouter,
     ) -> tuple[dict[int, list[dict[str, object]]], dict[int, list[dict[str, object]]]]:
         valid_partition_rows: dict[int, list[dict[str, object]]] = {}
         invalid_partition_rows: dict[int, list[dict[str, object]]] = {}

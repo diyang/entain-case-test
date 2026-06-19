@@ -11,7 +11,7 @@ flowchart TD
         direction TD
         scan["CSV row-batch reader<br/>read --batch-size rows"]
         workers["Concurrency-compatible row-batch workers<br/>validate rows<br/>schema + business rules"]
-        router["FeaturePartitionRouter<br/>partition rows by customer<br/>ordered partition writes"]
+        router["Customer-complete partition routing<br/>customer_id -> partition<br/>ordered parquet writes"]
         valid["Curated validated-bets batches<br/>customer-complete partitions<br/>valid_bets/part-*.parquet"]
         invalid["Invalid-record quarantine<br/>invalid_bets/part-*.parquet"]
 
@@ -22,7 +22,7 @@ flowchart TD
 
     subgraph feature_engineering["Optional Feature Engineering partition based batch process"]
         direction TD
-        feature["Customer feature generation<br/>concurrency-compatible partition workers"]
+        feature["Customer feature generation<br/>concurrency-compatible partition-based batch workers"]
         output["Versioned feature output<br/>customer_features/part-*.parquet"]
 
         feature --> output
@@ -55,9 +55,9 @@ Both public commands run a staged batch workflow:
 2. `BetValidationBatchProcess` reads the bounded raw CSV in row batches with `--batch-size`.
 3. For each row batch, a validation row-batch worker validates rows against schema and business rules.
 4. Local execution defaults to one validation worker. `--validation-workers` can be increased to validate row batches concurrently.
-5. `FeaturePartitionRouter` receives validated row-batch results in source order, keeps every `customer_id` in one feature partition, and writes customer-complete `valid_bets/part-*.parquet` batches.
+5. Customer-complete partition routing receives validated row-batch results in source order, keeps every `customer_id` in one feature partition, and writes customer-complete `valid_bets/part-*.parquet` batches.
 6. If the command is `validate`, the run stops after validation artifacts are written and committed.
-7. If the command is `build-features`, `BetFeatureBatchProcess` runs the optional feature engineering partition based batch process. It reads `valid_bets/part-*.parquet`; each valid part is one customer-complete feature batch handled by a partition worker.
+7. If the command is `build-features`, `BetFeatureBatchProcess` runs the optional feature engineering partition based batch process. It reads `valid_bets/part-*.parquet`; each valid part is one customer-complete feature batch handled by a partition-based batch worker.
 8. Local execution defaults to one feature worker. `--feature-workers` can be increased to process feature partitions concurrently. Each worker writes one distinct `customer_features/part-*.parquet` file.
 9. `RunArtifactPublisher` checks required artifacts, writes `_SUCCESS`, and publishes `outputs/runs/<run_id>`.
 

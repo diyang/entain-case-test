@@ -22,7 +22,7 @@ flowchart TD
         direction TD
         scan["CSV row-batch reader<br/>read --batch-size rows"]
         row_worker["Concurrency-compatible row-batch workers<br/>validate rows<br/>schema + business rules"]
-        router["FeaturePartitionRouter<br/>partition rows by customer<br/>ordered partition writes"]
+        router["Customer-complete partition routing<br/>customer_id -> partition<br/>ordered parquet writes"]
         valid["Curated validated-bets batches<br/>customer-complete partitions<br/>valid_bets/part-*.parquet"]
         invalid["Invalid-record quarantine<br/>invalid_bets/part-*.parquet"]
 
@@ -33,7 +33,7 @@ flowchart TD
 
     subgraph feature_engineering["Optional Feature Engineering partition based batch process"]
         direction TD
-        feature_worker["Customer feature generation<br/>concurrency-compatible partition workers"]
+        feature_worker["Customer feature generation<br/>concurrency-compatible partition-based batch workers"]
         feature_output["Versioned customer features<br/>customer_features/part-*.parquet"]
 
         feature_worker --> feature_output
@@ -67,11 +67,11 @@ flowchart TD
 | Validation batch process | Owns the validation stage over a bounded source file. | Raw CSV file | Curated valid-bets and invalid-record partitions |
 | CSV row-batch reader | Reads the bounded source file in `--batch-size` row batches without loading the whole file into memory. | Raw CSV file | Row batches |
 | Concurrency-compatible row-batch workers | Validate row batches against schema and business rules. Local execution defaults to one worker, but the design can run multiple workers. | One row batch per worker | Valid rows, invalid rows, validation metrics |
-| FeaturePartitionRouter | Assigns rows to customer-complete partitions and coordinates ordered parquet writes. | Valid and invalid validation results | Partitioned valid and invalid parquet rows |
+| Customer-complete partition routing | Assigns rows to customer-complete partitions and coordinates ordered parquet writes. | Valid and invalid validation results | Partitioned valid and invalid parquet rows |
 | Curated validated-bets batches | Trusted handoff from validation to feature engineering. | Valid rows | `validation/valid_bets/part-*.parquet` |
 | Invalid-record quarantine | Stores rejected rows for investigation and correction. | Invalid rows plus validation errors | `validation/invalid_bets/part-*.parquet` |
 | Optional Feature Engineering partition based batch process | Runs only for `build-features`; owns customer feature generation from valid-bets partitions. | `validation/valid_bets/part-*.parquet` | Customer feature partitions |
-| Customer feature generation | Runs feature partition workers over customer-complete valid-bets parts. Local execution defaults to one worker, but the design can run multiple workers. | One valid-bets partition per worker | Feature rows |
+| Customer feature generation | Runs partition-based batch workers over customer-complete valid-bets parts. Local execution defaults to one worker, but the design can run multiple workers. | One valid-bets partition per worker | Feature rows |
 | Versioned customer features | ML-facing customer-level feature dataset. | Feature rows | `features/customer_features/part-*.parquet` |
 | ACID-style publish | Checks required artifacts, writes `_SUCCESS`, and publishes the staged run. | Staged validation and optional feature artifacts | Committed run directory |
 | Committed run | Stable output location that downstream systems can safely read. | Published artifacts | `outputs/runs/<run_id>/` |
@@ -87,7 +87,7 @@ flowchart TD
 
 Validation reads row batches from the bounded source file. The batch size defaults to `DEFAULT_BATCH_ROWS = 1000`. Each row batch is validated by `BetValidationRowBatchWorker`. Local execution defaults to one validation worker; `--validation-workers` can be increased when concurrent row-batch validation is wanted. The pipeline does not perform a separate full-file row-count pass before validation.
 
-Rows are routed by `FeaturePartitionRouter`:
+Rows are routed by customer-complete partition routing:
 
 - If `--feature-partition-count` is set, customer routing is deterministic hash modulo the supplied count.
 - If `--feature-partition-count` is not set, `--target-feature-partition-rows` controls dynamic partition creation. It defaults to `DEFAULT_BATCH_ROWS`. New customers are assigned to the current partition until that partition reaches the target. Existing customers always stay in their original partition.
@@ -96,13 +96,13 @@ Valid rows are written to `validation/valid_bets/part-*.parquet`. Invalid rows a
 
 Partition routing and parquet writes are coordinated in source-row-batch order. That keeps output deterministic even when validation uses multiple workers.
 
-Feature engineering is a partition based batch process. Local execution defaults to one feature worker; `--feature-workers` can be increased when concurrent partition processing is wanted. Each `BetFeaturePartitionWorker` reads one customer-complete valid-bets part and writes the matching `customer_features/part-*.parquet` file, so feature workers do not share writers.
+Feature engineering is a partition based batch process. Local execution defaults to one feature worker; `--feature-workers` can be increased when concurrent partition processing is wanted. Each `BetFeaturePartitionWorker` is a partition-based batch worker: it reads one customer-complete valid-bets part and writes the matching `customer_features/part-*.parquet` file, so feature workers do not share writers.
 
 ## Concurrency Support
 
 The pipeline supports concurrency in two separate places:
 
-- **Validation concurrency:** local execution defaults to one worker. `--validation-workers` controls how many raw CSV row batches can be validated at the same time when concurrency is enabled. The validation workers only validate rows. `FeaturePartitionRouter` applies customer partition routing and parquet writes in source-row-batch order, so concurrent validation does not change output determinism.
+- **Validation concurrency:** local execution defaults to one worker. `--validation-workers` controls how many raw CSV row batches can be validated at the same time when concurrency is enabled. The validation workers only validate rows. Customer-complete partition routing assigns each customer to one partition and coordinates parquet writes in source-row-batch order, so concurrent validation does not change output determinism.
 - **Feature concurrency:** local execution defaults to one worker. `--feature-workers` controls how many customer-complete valid-bets partitions can be processed at the same time when concurrency is enabled. Each feature worker reads one `valid_bets/part-*.parquet` file and writes one matching `customer_features/part-*.parquet` file, so feature workers do not share output writers.
 
 Concurrency improves throughput without changing the logical batch boundaries. Validation row batches are memory boundaries. Feature partitions are customer-completeness boundaries.

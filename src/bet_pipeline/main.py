@@ -5,15 +5,18 @@ import sys
 from pathlib import Path
 from typing import TextIO
 
-from bet_pipeline.batch import (
+from bet_pipeline.batch_process.feature_batch import BetFeaturePartitionBatchProcess
+from bet_pipeline.batch_process.raw_partition_batch import (
+    CustomerCompletePartitionSettings,
+    RawBetCustomerCompletePartitionBatchProcess,
+)
+from bet_pipeline.batch_process.run_artifacts import (
     DEFAULT_BATCH_ROWS,
     FIRST_N_BETS,
-    BetFeatureBatchProcess,
-    BetValidationBatchProcess,
     RunArtifactPublisher,
-    ValidationBatchSettings,
     ValidationCheckpointLoader,
 )
+from bet_pipeline.batch_process.validation_batch import BetValidationPartitionBatchProcess, ValidationBatchSettings
 
 
 class RunSummaryPrinter:
@@ -83,6 +86,7 @@ class RunSummaryPrinter:
         features = manifest.get("features", {})
         self._write("Outputs")
         self._write(f"  run_dir: {outputs.get('run_dir', 'unknown')}")
+        self._write(f"  raw_bets: {outputs.get('raw_bets_dir', 'unknown')}")
         self._write(f"  valid_bets: {outputs.get('valid_bets_dir', 'unknown')}")
         self._write(f"  invalid_bets: {outputs.get('invalid_bets_dir', 'unknown')}")
         if include_features:
@@ -131,7 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--validation-workers",
         type=int,
         default=1,
-        help="Concurrent row-batch validation workers. Partition writes remain ordered. Default: 1",
+        help="Concurrent partition-level validation workers. Default: 1",
     )
     batch_source_parser.add_argument(
         "--target-feature-partition-rows",
@@ -206,15 +210,26 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 if args.command == "build-features" and args.input is None:
                     parser.error("build-features requires either --input or --from-validation-run")
-                validation_batch_process = BetValidationBatchProcess()
-                partitioned_input = validation_batch_process.process(
+
+                # Bronze layer: stream raw CSV into customer-complete raw parquet partitions.
+                raw_partition_process = RawBetCustomerCompletePartitionBatchProcess()
+                raw_partitioned_input = raw_partition_process.process(
                     args.input,
-                    artifact_publisher.validation_dir,
-                    ValidationBatchSettings(
+                    artifact_publisher.raw_dir,
+                    CustomerCompletePartitionSettings(
                         batch_size=args.batch_size,
-                        validation_worker_count=args.validation_workers,
                         feature_partition_count=args.feature_partition_count,
                         target_feature_partition_rows=args.target_feature_partition_rows,
+                    ),
+                )
+
+                # Silver layer: validate each customer-complete partition into valid and invalid bets.
+                validation_process = BetValidationPartitionBatchProcess()
+                partitioned_input = validation_process.process(
+                    raw_partitioned_input,
+                    artifact_publisher.validation_dir,
+                    ValidationBatchSettings(
+                        validation_worker_count=args.validation_workers,
                         generated_at=artifact_publisher.validation_generated_at,
                     ),
                 )
@@ -226,8 +241,9 @@ def main(argv: list[str] | None = None) -> int:
                 RunSummaryPrinter().print_validation_summary(manifest)
                 return 0
 
-            feature_batch_process = BetFeatureBatchProcess()
-            feature_result = feature_batch_process.process(
+            # Gold layer: build customer-level ML features from validated bet partitions.
+            feature_process = BetFeaturePartitionBatchProcess()
+            feature_result = feature_process.process(
                 partitioned_input,
                 artifact_publisher.features_dir,
                 artifact_publisher.feature_generated_at,

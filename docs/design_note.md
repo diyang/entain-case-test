@@ -12,8 +12,8 @@ The CLI supports three production workflows:
 
 | Workflow | Command shape | What it does |
 | --- | --- | --- |
-| Validation only | `bet-pipeline validate --input data/bets.csv --output outputs --run-id 001` | Reads the raw CSV in row batches, validates rows, writes valid and invalid parquet partitions, and commits a validation run. |
-| Validate and build features | `bet-pipeline build-features --input data/bets.csv --output outputs --run-id 001` | Runs validation first, then builds customer features from the newly created valid-bets partitions. |
+| Validation only | `bet-pipeline validate --input data/bets.csv --output outputs --run-id 001` | Reads the raw CSV in row batches, writes customer-complete raw partitions, validates each raw partition, writes valid and invalid parquet partitions, and commits a validation run. |
+| Validate and build features | `bet-pipeline build-features --input data/bets.csv --output outputs --run-id 001` | Runs raw partitioning and validation first, then builds customer features from the newly created valid-bets partitions. |
 | Build from validation checkpoint | `bet-pipeline build-features --from-validation-run outputs/runs/001 --output outputs --run-id 001-features` | Reuses a committed validation run, skips raw CSV validation, and writes a new immutable feature run. |
 
 The checkpoint path is important for large inputs. If validation has already succeeded, feature generation should not reread the raw CSV, rerun validation, or rewrite `valid_bets` and `invalid_bets`.
@@ -34,17 +34,25 @@ bet-pipeline build-features \
 
 ## Components
 
+The pipeline uses three data layers:
+
+- **Bronze layer: Customer Completeness Partition** stores raw rows in customer-complete parquet partitions. It preserves source records while making sure all rows for the same `customer_id` stay together for later customer-level work.
+- **Silver layer: Validated Bets and Invalid-Bet Quarantine** validates each customer-complete raw partition, writes curated valid bets, and isolates invalid records for review.
+- **Gold layer: Customer Feature Dataset** builds one customer-level ML feature dataset from the silver valid-bets partitions.
+
 | Component | Responsibility | Data in | Data out |
 | --- | --- | --- | --- |
 | Raw betting landing area | Holds the immutable source extract for a run. | Raw CSV such as `data/bets.csv` | CSV rows for validation |
 | Scheduler or job trigger | Starts `validate` or `build-features` with input paths, run id, and sizing parameters. | Schedule, manual request, rerun, or backfill request | CLI invocation |
-| `BetValidationBatchProcess` | Orchestrates validation over raw CSV row batches. | Raw CSV path and `ValidationBatchSettings` | `PartitionedInput` metadata plus valid/invalid parquet parts |
-| `BetValidationRowBatchWorker` | Validates one raw row batch. | Up to `--batch-size` CSV rows | Valid rows, invalid rows, validation failure counts |
-| Customer-complete partition routing | Keeps every `customer_id` in one feature partition while validation streams through row batches. | Valid and invalid row-batch outputs | `valid_bets/part-*.parquet` and `invalid_bets/part-*.parquet` |
-| Invalid-record quarantine | Preserves rejected rows for review. | Invalid rows plus validation errors | `validation/invalid_bets/part-*.parquet` |
+| Bronze: `RawBetCustomerCompletePartitionBatchProcess` | Streams raw CSV row batches into customer-complete parquet partitions. | Raw CSV path and partition settings | Raw parquet partition metadata |
+| Bronze: `RawBetRowBatchWorker` | Handles one raw CSV row batch end to end for raw partitioning. | Up to `--batch-size` CSV rows | Customer-complete `raw_bets/part-*.parquet` writes |
+| Bronze: Customer-complete partition routing | Keeps every `customer_id` in one partition while raw CSV streams through row batches. | Raw row-batch outputs | `raw_bets/part-*.parquet` |
+| Silver: `BetValidationPartitionBatchProcess` | Orchestrates validation over customer-complete raw partitions. | Raw parquet partitions and `ValidationBatchSettings` | `PartitionedInput` metadata plus valid/invalid parquet parts |
+| Silver: `BetValidationPartitionWorker` | Validates one customer-complete raw partition, applies partition-level uniqueness and sequence checks, and writes valid/invalid parquet parts. | One `raw_bets/part-*.parquet` file | Matching `valid_bets/part-*.parquet` and `invalid_bets/part-*.parquet` |
+| Silver: Invalid-record quarantine | Preserves rejected rows for review. | Invalid rows plus validation errors | `validation/invalid_bets/part-*.parquet` |
 | `ValidationCheckpointLoader` | Loads a committed validation run for feature generation. | `outputs/runs/<validation_run_id>` | Existing valid-bets partitions and validation report |
-| `BetFeatureBatchProcess` | Orchestrates feature engineering over valid-bets partitions. | Customer-complete `valid_bets/part-*.parquet` files | Feature count and first-N completeness metrics |
-| `BetFeaturePartitionWorker` | Builds features for one customer-complete valid-bets partition. | One valid-bets parquet part | Matching `customer_features/part-*.parquet` |
+| Gold: `BetFeaturePartitionBatchProcess` | Orchestrates feature engineering over valid-bets partitions. | Customer-complete `valid_bets/part-*.parquet` files | Feature count and first-N completeness metrics |
+| Gold: `BetFeaturePartitionWorker` | Builds features for one customer-complete valid-bets partition. | One valid-bets parquet part | Matching `customer_features/part-*.parquet` |
 | `RunArtifactPublisher` | Owns staging, manifest/report writes, completeness checks, and publish. | Staged validation and/or feature artifacts | Committed `outputs/runs/<run_id>` with `_SUCCESS` |
 | Downstream consumers | Read committed feature runs. | `customer_features/part-*.parquet` plus reports/manifest | Training data, scoring input, BI/CRM/decisioning data |
 
@@ -52,16 +60,17 @@ bet-pipeline build-features \
 
 There are two different batch boundaries:
 
-- **Validation row batch:** `--batch-size` raw CSV rows read and validated at a time.
+- **Raw partition row batch:** `--batch-size` raw CSV rows read and routed at a time.
+- **Validation partition batch:** one customer-complete `raw_bets/part-*.parquet` partition.
 - **Feature batch:** one customer-complete `valid_bets/part-*.parquet` partition.
 
-Validation row batches control memory usage. They are not feature boundaries. A customer can appear in many raw row batches, so feature completeness is enforced by customer partitioning, not by CSV read chunks.
+Raw partition row batches control CSV memory usage. They are not feature boundaries. A customer can appear in many raw row batches, so feature completeness is enforced by customer partitioning, not by CSV read chunks.
 
 Feature partitions are customer-complete. Every row for the same `customer_id` is routed to the same partition, so a feature worker can build the first-N feature row without needing records from another partition.
 
 Concurrency is compatible with this model:
 
-- `--validation-workers` can validate multiple raw row batches concurrently. Partition routing and parquet writes are still coordinated in source-row-batch order.
+- `--validation-workers` can validate multiple customer-complete raw partitions concurrently.
 - `--feature-workers` can process multiple valid-bets partitions concurrently. Each worker writes a distinct feature parquet part, so workers do not share output writers.
 
 ## Why Batch
@@ -82,12 +91,12 @@ Validation enforces the row-level rules from the task:
 - payout formula by `bet_result` and `stake_type`
 - `return_for_entain` formula by `bet_result` and `stake_type`
 - parseable identifiers, timestamps, and numeric values
-- duplicate `bet_id` values across validation row batches
-- duplicate `(customer_id, bet_num)` values across validation row batches
+- duplicate `bet_id` values across the source
+- duplicate `(customer_id, bet_num)` values inside customer-complete partitions
 
 Curated outputs use explicit Arrow schemas from `schema.py`. Validation reports include `schema_version`; feature reports include `feature_set_version`, `feature_columns`, and `first_n_bets`. Breaking schema or feature changes should create a new version instead of changing existing semantics in place.
 
-The local row-batch validation path keeps streaming uniqueness state, so later duplicates are quarantined before partition writes. After customer-complete partition files are written, a partition-level sequence finalizer checks the raw observed `bet_num` sequence for each customer using both valid and invalid rows in that partition. If a customer's raw sequence has a gap, such as `1, 2, 4`, valid rows for that affected customer are demoted into `invalid_bets` with `customer_bet_num_sequence` before the run is published. The finalizer reads one customer-complete partition at a time, so it enforces the rule without loading the full source file into memory.
+The raw partition stage keeps source-level `bet_id` lineage, so later duplicate `bet_id` rows can be quarantined during partition validation. After customer-complete partition files are written, each validation partition worker checks the raw observed `bet_num` sequence for each customer using both valid and invalid rows in that partition. If a customer's raw sequence has a gap, such as `1, 2, 4`, valid rows for that affected customer are demoted into `invalid_bets` with `customer_bet_num_sequence` before the run is published. Each worker reads one customer-complete partition at a time, so it enforces the rule without loading the full source file into memory.
 
 ## Invalid Records
 
@@ -138,7 +147,7 @@ It is allowed only when:
 When reuse is enabled, the pipeline skips:
 
 - raw CSV reading
-- row-batch validation
+- raw partition validation
 - payout and `return_for_entain` formula checks
 - invalid-record quarantine creation
 - customer-complete valid/invalid partition writing

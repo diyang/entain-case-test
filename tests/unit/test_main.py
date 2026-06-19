@@ -7,7 +7,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from bet_pipeline import main
-from bet_pipeline.batch import ValidationBatchSettings, ValidationCheckpoint
+from bet_pipeline.batch_process.raw_partition_batch import CustomerCompletePartitionSettings
+from bet_pipeline.batch_process.run_artifacts import ValidationCheckpoint
+from bet_pipeline.batch_process.validation_batch import ValidationBatchSettings
 
 
 def _manifest() -> dict:
@@ -38,6 +40,7 @@ def _manifest() -> dict:
         },
         "outputs": {
             "run_dir": "outputs/runs/run",
+            "raw_bets_dir": "outputs/runs/run/raw/raw_bets",
             "valid_bets_dir": "outputs/runs/run/validation/valid_bets",
             "invalid_bets_dir": "outputs/runs/run/validation/invalid_bets",
             "manifest": "outputs/runs/run/run_manifest.json",
@@ -50,19 +53,24 @@ class MainTests(unittest.TestCase):
     def test_validate_command_uses_source_level_validation(self) -> None:
         with (
             patch("bet_pipeline.main.RunArtifactPublisher") as run_class,
-            patch("bet_pipeline.main.BetValidationBatchProcess") as validation_process_class,
-            patch("bet_pipeline.main.BetFeatureBatchProcess") as feature_process_class,
+            patch("bet_pipeline.main.RawBetCustomerCompletePartitionBatchProcess") as raw_partition_process_class,
+            patch("bet_pipeline.main.BetValidationPartitionBatchProcess") as validation_process_class,
+            patch("bet_pipeline.main.BetFeaturePartitionBatchProcess") as feature_process_class,
         ):
             run = run_class.return_value
+            run.raw_dir = "outputs/_staging/run/raw"
             run.validation_dir = "outputs/_staging/run/validation"
             run.validation_generated_at = "2024-01-01T00:00:00+00:00"
+            raw_partitioned_input = SimpleNamespace()
             partitioned_input = SimpleNamespace()
             report = {
                 "total_rows": 3,
                 "valid_rows": 2,
                 "invalid_rows": 1,
             }
+            raw_partition_process = raw_partition_process_class.return_value
             validation_process = validation_process_class.return_value
+            raw_partition_process.process.return_value = raw_partitioned_input
             validation_process.process.return_value = partitioned_input
             run.write_validation_report.return_value = report
             run.write_manifest.return_value = _manifest()
@@ -83,14 +91,20 @@ class MainTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             run_class.assert_called_once_with(Path("outputs"), None)
-            validation_process.process.assert_called_once_with(
+            raw_partition_process.process.assert_called_once_with(
                 "data/bets.csv",
-                "outputs/_staging/run/validation",
-                ValidationBatchSettings(
+                "outputs/_staging/run/raw",
+                CustomerCompletePartitionSettings(
                     batch_size=1000,
-                    validation_worker_count=1,
                     feature_partition_count=8,
                     target_feature_partition_rows=1000,
+                ),
+            )
+            validation_process.process.assert_called_once_with(
+                raw_partitioned_input,
+                "outputs/_staging/run/validation",
+                ValidationBatchSettings(
+                    validation_worker_count=1,
                     generated_at="2024-01-01T00:00:00+00:00",
                 ),
             )
@@ -101,14 +115,17 @@ class MainTests(unittest.TestCase):
     def test_build_features_command_validates_then_builds_from_validated_result(self) -> None:
         with (
             patch("bet_pipeline.main.RunArtifactPublisher") as run_class,
-            patch("bet_pipeline.main.BetValidationBatchProcess") as validation_process_class,
-            patch("bet_pipeline.main.BetFeatureBatchProcess") as feature_process_class,
+            patch("bet_pipeline.main.RawBetCustomerCompletePartitionBatchProcess") as raw_partition_process_class,
+            patch("bet_pipeline.main.BetValidationPartitionBatchProcess") as validation_process_class,
+            patch("bet_pipeline.main.BetFeaturePartitionBatchProcess") as feature_process_class,
         ):
             run = run_class.return_value
+            run.raw_dir = "outputs/_staging/run-1/raw"
             run.validation_dir = "outputs/_staging/run-1/validation"
             run.features_dir = "outputs/_staging/run-1/features"
             run.validation_generated_at = "2024-01-01T00:00:00+00:00"
             run.feature_generated_at = "2024-01-01T00:00:01+00:00"
+            raw_partitioned_input = SimpleNamespace()
             partitioned_input = SimpleNamespace()
             report = {
                 "total_rows": 3,
@@ -116,8 +133,10 @@ class MainTests(unittest.TestCase):
                 "invalid_rows": 1,
             }
             feature_result = SimpleNamespace(feature_count=1, incomplete_first_n_count=0)
+            raw_partition_process = raw_partition_process_class.return_value
             validation_process = validation_process_class.return_value
             feature_process = feature_process_class.return_value
+            raw_partition_process.process.return_value = raw_partitioned_input
             validation_process.process.return_value = partitioned_input
             feature_process.process.return_value = feature_result
             run.write_validation_report.return_value = report
@@ -145,14 +164,20 @@ class MainTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             run_class.assert_called_once_with(Path("outputs"), "run-1")
-            validation_process.process.assert_called_once_with(
+            raw_partition_process.process.assert_called_once_with(
                 "data/bets.csv",
-                "outputs/_staging/run-1/validation",
-                ValidationBatchSettings(
+                "outputs/_staging/run-1/raw",
+                CustomerCompletePartitionSettings(
                     batch_size=500,
-                    validation_worker_count=3,
                     feature_partition_count=4,
                     target_feature_partition_rows=1000,
+                ),
+            )
+            validation_process.process.assert_called_once_with(
+                raw_partitioned_input,
+                "outputs/_staging/run-1/validation",
+                ValidationBatchSettings(
+                    validation_worker_count=3,
                     generated_at="2024-01-01T00:00:00+00:00",
                 ),
             )
@@ -174,17 +199,21 @@ class MainTests(unittest.TestCase):
     def test_build_features_passes_target_feature_partition_rows_to_validation(self) -> None:
         with (
             patch("bet_pipeline.main.RunArtifactPublisher") as run_class,
-            patch("bet_pipeline.main.BetValidationBatchProcess") as validation_process_class,
-            patch("bet_pipeline.main.BetFeatureBatchProcess") as feature_process_class,
+            patch("bet_pipeline.main.RawBetCustomerCompletePartitionBatchProcess") as raw_partition_process_class,
+            patch("bet_pipeline.main.BetValidationPartitionBatchProcess") as validation_process_class,
+            patch("bet_pipeline.main.BetFeaturePartitionBatchProcess") as feature_process_class,
         ):
             run = run_class.return_value
+            run.raw_dir = "outputs/_staging/run/raw"
             run.validation_dir = "outputs/_staging/run/validation"
             run.features_dir = "outputs/_staging/run/features"
             run.validation_generated_at = "2024-01-01T00:00:00+00:00"
             run.feature_generated_at = "2024-01-01T00:00:01+00:00"
+            raw_partitioned_input = SimpleNamespace()
             partitioned_input = SimpleNamespace()
             report = {"total_rows": 10, "valid_rows": 10, "invalid_rows": 0}
             feature_result = SimpleNamespace(feature_count=2, incomplete_first_n_count=0, first_n_bets=10)
+            raw_partition_process_class.return_value.process.return_value = raw_partitioned_input
             validation_process_class.return_value.process.return_value = partitioned_input
             feature_process_class.return_value.process.return_value = feature_result
             run.write_validation_report.return_value = report
@@ -205,14 +234,20 @@ class MainTests(unittest.TestCase):
             )
 
             self.assertEqual(exit_code, 0)
-            validation_process_class.return_value.process.assert_called_once_with(
+            raw_partition_process_class.return_value.process.assert_called_once_with(
                 "data/bets.csv",
-                "outputs/_staging/run/validation",
-                ValidationBatchSettings(
+                "outputs/_staging/run/raw",
+                CustomerCompletePartitionSettings(
                     batch_size=1000,
-                    validation_worker_count=1,
                     feature_partition_count=None,
                     target_feature_partition_rows=1000,
+                ),
+            )
+            validation_process_class.return_value.process.assert_called_once_with(
+                raw_partitioned_input,
+                "outputs/_staging/run/validation",
+                ValidationBatchSettings(
+                    validation_worker_count=1,
                     generated_at="2024-01-01T00:00:00+00:00",
                 ),
             )
@@ -227,14 +262,18 @@ class MainTests(unittest.TestCase):
     def test_target_feature_partition_rows_uses_default_batch_rows(self) -> None:
         with (
             patch("bet_pipeline.main.RunArtifactPublisher") as run_class,
-            patch("bet_pipeline.main.BetValidationBatchProcess") as validation_process_class,
-            patch("bet_pipeline.main.BetFeatureBatchProcess") as feature_process_class,
+            patch("bet_pipeline.main.RawBetCustomerCompletePartitionBatchProcess") as raw_partition_process_class,
+            patch("bet_pipeline.main.BetValidationPartitionBatchProcess") as validation_process_class,
+            patch("bet_pipeline.main.BetFeaturePartitionBatchProcess") as feature_process_class,
         ):
             run = run_class.return_value
+            run.raw_dir = "outputs/_staging/run/raw"
             run.validation_dir = "outputs/_staging/run/validation"
             run.validation_generated_at = "2024-01-01T00:00:00+00:00"
+            raw_partitioned_input = SimpleNamespace()
             partitioned_input = SimpleNamespace()
             report = {"total_rows": 10, "valid_rows": 10, "invalid_rows": 0}
+            raw_partition_process_class.return_value.process.return_value = raw_partitioned_input
             validation_process_class.return_value.process.return_value = partitioned_input
             run.write_validation_report.return_value = report
             run.write_manifest.return_value = _manifest()
@@ -252,14 +291,20 @@ class MainTests(unittest.TestCase):
             )
 
             self.assertEqual(exit_code, 0)
-            validation_process_class.return_value.process.assert_called_once_with(
+            raw_partition_process_class.return_value.process.assert_called_once_with(
                 "data/bets.csv",
-                "outputs/_staging/run/validation",
-                ValidationBatchSettings(
+                "outputs/_staging/run/raw",
+                CustomerCompletePartitionSettings(
                     batch_size=750,
-                    validation_worker_count=1,
                     feature_partition_count=None,
                     target_feature_partition_rows=1000,
+                ),
+            )
+            validation_process_class.return_value.process.assert_called_once_with(
+                raw_partitioned_input,
+                "outputs/_staging/run/validation",
+                ValidationBatchSettings(
+                    validation_worker_count=1,
                     generated_at="2024-01-01T00:00:00+00:00",
                 ),
             )
@@ -270,17 +315,21 @@ class MainTests(unittest.TestCase):
     def test_build_features_normalizes_features_output_to_batch_root(self) -> None:
         with (
             patch("bet_pipeline.main.RunArtifactPublisher") as run_class,
-            patch("bet_pipeline.main.BetValidationBatchProcess") as validation_process_class,
-            patch("bet_pipeline.main.BetFeatureBatchProcess") as feature_process_class,
+            patch("bet_pipeline.main.RawBetCustomerCompletePartitionBatchProcess") as raw_partition_process_class,
+            patch("bet_pipeline.main.BetValidationPartitionBatchProcess") as validation_process_class,
+            patch("bet_pipeline.main.BetFeaturePartitionBatchProcess") as feature_process_class,
         ):
             run = run_class.return_value
+            run.raw_dir = "outputs/_staging/run/raw"
             run.validation_dir = "outputs/_staging/run/validation"
             run.features_dir = "outputs/_staging/run/features"
             run.validation_generated_at = "2024-01-01T00:00:00+00:00"
             run.feature_generated_at = "2024-01-01T00:00:01+00:00"
+            raw_partitioned_input = SimpleNamespace()
             partitioned_input = SimpleNamespace()
             report = {"total_rows": 1, "valid_rows": 1, "invalid_rows": 0}
             feature_result = SimpleNamespace(feature_count=1, incomplete_first_n_count=0)
+            raw_partition_process_class.return_value.process.return_value = raw_partitioned_input
             validation_process_class.return_value.process.return_value = partitioned_input
             feature_process_class.return_value.process.return_value = feature_result
             run.write_validation_report.return_value = report
@@ -303,8 +352,8 @@ class MainTests(unittest.TestCase):
         with (
             patch("bet_pipeline.main.RunArtifactPublisher") as run_class,
             patch("bet_pipeline.main.ValidationCheckpointLoader") as checkpoint_loader_class,
-            patch("bet_pipeline.main.BetValidationBatchProcess") as validation_process_class,
-            patch("bet_pipeline.main.BetFeatureBatchProcess") as feature_process_class,
+            patch("bet_pipeline.main.BetValidationPartitionBatchProcess") as validation_process_class,
+            patch("bet_pipeline.main.BetFeaturePartitionBatchProcess") as feature_process_class,
         ):
             run = run_class.return_value
             run.features_dir = "outputs/_staging/features-001/features"
@@ -347,14 +396,18 @@ class MainTests(unittest.TestCase):
     def test_validate_normalizes_validation_output_to_batch_root(self) -> None:
         with (
             patch("bet_pipeline.main.RunArtifactPublisher") as run_class,
-            patch("bet_pipeline.main.BetValidationBatchProcess") as validation_process_class,
-            patch("bet_pipeline.main.BetFeatureBatchProcess"),
+            patch("bet_pipeline.main.RawBetCustomerCompletePartitionBatchProcess") as raw_partition_process_class,
+            patch("bet_pipeline.main.BetValidationPartitionBatchProcess") as validation_process_class,
+            patch("bet_pipeline.main.BetFeaturePartitionBatchProcess"),
         ):
             run = run_class.return_value
+            run.raw_dir = "outputs/_staging/run/raw"
             run.validation_dir = "outputs/_staging/run/validation"
             run.validation_generated_at = "2024-01-01T00:00:00+00:00"
+            raw_partitioned_input = SimpleNamespace()
             partitioned_input = SimpleNamespace()
             report = {"total_rows": 1, "valid_rows": 1, "invalid_rows": 0}
+            raw_partition_process_class.return_value.process.return_value = raw_partitioned_input
             validation_process_class.return_value.process.return_value = partitioned_input
             run.write_validation_report.return_value = report
             run.write_manifest.return_value = _manifest()

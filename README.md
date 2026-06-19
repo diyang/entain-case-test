@@ -10,7 +10,12 @@ Dockerfile
 README.md
 src/bet_pipeline/
   __init__.py
-  batch.py
+  batch_process/
+    __init__.py
+    run_artifacts.py
+    raw_partition_batch.py
+    validation_batch.py
+    feature_batch.py
   main.py
   schema.py
   validation.py
@@ -49,7 +54,7 @@ You can set the internal row batch size:
 uv run bet-pipeline build-features --input data/bets.csv --output outputs/ --run-id local-001 --batch-size 1000
 ```
 
-Local execution defaults to one validation worker. You can enable concurrent row-batch validation while keeping partition writes deterministic:
+Local execution defaults to one validation worker. You can enable concurrent customer-complete partition validation:
 
 ```bash
 uv run bet-pipeline build-features --input data/bets.csv --output outputs/ --run-id local-001 --validation-workers 4
@@ -88,11 +93,11 @@ uv run bet-pipeline build-features \
   --run-id local-001-features
 ```
 
-Feature engineering is a batch phase inside the public `build-features` command. `RunArtifactPublisher` owns staging, reports, manifest, and commit. During source validation, `BetValidationBatchProcess` reads the CSV in row batches and creates a `BetValidationRowBatchWorker` for each row batch. Each worker applies row-level validation immediately. The validation process then routes valid and invalid rows through customer-complete partition routing and writes parquet partitions in source-row-batch order. For feature runs, `BetFeatureBatchProcess` iterates feature partitions and creates a `BetFeaturePartitionWorker` for each partition to build and write features.
+Feature engineering is a batch phase inside the public `build-features` command. `RunArtifactPublisher` owns staging, reports, manifest, and commit. The raw partition process streams CSV row batches into customer-complete parquet partitions. `BetValidationPartitionBatchProcess` validates those raw partitions and writes valid and invalid parquet partitions. For feature runs, `BetFeaturePartitionBatchProcess` iterates valid-bets partitions and creates a `BetFeaturePartitionWorker` for each partition to build and write features.
 
 For large data, `build-features --from-validation-run outputs/runs/<validation_run_id>` skips raw CSV validation and reuses the committed `validation/valid_bets/part-*.parquet` checkpoint. The checkpoint must have `_SUCCESS`, its validation schema version must match the current code, and the new feature run records `source_validation_run_id` in its manifest. The committed validation run is never mutated.
 
-`--batch-size` controls how many source rows are read and validated at a time. It is not a feature boundary. `--validation-workers` defaults to 1 and can be increased for concurrent row-batch validation; partition routing and parquet writes are still coordinated in source-row-batch order to keep output deterministic. `--feature-workers` defaults to 1 and can be increased for concurrent customer-complete feature partition processing; each worker writes a distinct `customer_features/part-*.parquet` file. `--target-feature-partition-rows` is the main sizing input for feature partitions and defaults to the same row-count constant as `--batch-size` (`DEFAULT_BATCH_ROWS = 1000`), so validation row batches and feature partitions are roughly aligned by default. If you change `--batch-size` and want feature partitions to track it, set `--target-feature-partition-rows` to the same value. `--feature-partition-count` controls the exact number of customer-hash feature partitions and overrides the dynamic target. All rows for the same `customer_id` go to the same partition, so customer features are not split across row batches. `--first-n-bets` controls the feature window size and defaults to 20 for the interview task.
+`--batch-size` controls how many source rows are read and routed at a time during raw partitioning. It is not a feature boundary. `--validation-workers` defaults to 1 and can be increased for concurrent customer-complete raw partition validation. `--feature-workers` defaults to 1 and can be increased for concurrent customer-complete feature partition processing; each worker writes a distinct `customer_features/part-*.parquet` file. `--target-feature-partition-rows` is the main sizing input for feature partitions and defaults to the same row-count constant as `--batch-size` (`DEFAULT_BATCH_ROWS = 1000`), so raw row batches and feature partitions are roughly aligned by default. If you change `--batch-size` and want feature partitions to track it, set `--target-feature-partition-rows` to the same value. `--feature-partition-count` controls the exact number of customer-hash feature partitions and overrides the dynamic target. All rows for the same `customer_id` go to the same partition, so customer features are not split across row batches. `--first-n-bets` controls the feature window size and defaults to 20 for the interview task.
 
 ## Outputs
 

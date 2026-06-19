@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from bet_pipeline.batch import (
-    BetFeatureBatchProcess,
-    BetValidationBatchProcess,
-    RunArtifactPublisher,
-    ValidationBatchSettings,
-    ValidationCheckpointLoader,
+from bet_pipeline.batch_process.feature_batch import BetFeaturePartitionBatchProcess
+from bet_pipeline.batch_process.raw_partition_batch import (
+    CustomerCompletePartitionSettings,
+    RawBetCustomerCompletePartitionBatchProcess,
 )
+from bet_pipeline.batch_process.run_artifacts import RunArtifactPublisher, ValidationCheckpointLoader
+from bet_pipeline.batch_process.validation_batch import BetValidationPartitionBatchProcess, ValidationBatchSettings
 from bet_pipeline.io import read_parquet, write_csv
 from bet_pipeline.schema import EXPECTED_COLUMNS
 
@@ -31,6 +32,45 @@ def _row(bet_id: str, bet_num: str, amount: str = "10") -> dict[str, str]:
     }
 
 
+@dataclass(frozen=True)
+class ValidationSourceConfig:
+    raw_dir: Path | None = None
+    batch_size: int = 1000
+    feature_partition_count: int | None = None
+    target_feature_partition_rows: int = 1000
+    validation_worker_count: int = 1
+    generated_at: str | None = None
+
+
+def _validate_source(
+    input_path: Path,
+    validation_dir: Path,
+    config: ValidationSourceConfig | None = None,
+):
+    if config is None:
+        config = ValidationSourceConfig()
+    raw_dir = config.raw_dir
+    if raw_dir is None:
+        raw_dir = validation_dir.parent / f"{validation_dir.name}-raw"
+    raw_partitioned_input = RawBetCustomerCompletePartitionBatchProcess().process(
+        input_path,
+        raw_dir,
+        CustomerCompletePartitionSettings(
+            batch_size=config.batch_size,
+            feature_partition_count=config.feature_partition_count,
+            target_feature_partition_rows=config.target_feature_partition_rows,
+        ),
+    )
+    return BetValidationPartitionBatchProcess().process(
+        raw_partitioned_input,
+        validation_dir,
+        ValidationBatchSettings(
+            validation_worker_count=config.validation_worker_count,
+            generated_at=config.generated_at,
+        ),
+    )
+
+
 class BatchWorkflowTests(unittest.TestCase):
     def test_target_feature_partition_rows_creates_dynamic_feature_partitions(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -41,30 +81,27 @@ class BatchWorkflowTests(unittest.TestCase):
                 row["customer_id"] = f"00000000-0000-4000-8000-{index:012d}"
             write_csv(input_path, rows, EXPECTED_COLUMNS)
 
-            partitioned_input = BetValidationBatchProcess().process(
+            partitioned_input = _validate_source(
                 input_path,
                 tmp_path / "validation",
-                ValidationBatchSettings(target_feature_partition_rows=2),
+                ValidationSourceConfig(target_feature_partition_rows=2),
             )
             self.assertEqual(partitioned_input.feature_partition_count, 3)
             self.assertEqual(len(partitioned_input.partition_paths), 3)
 
-            fixed_partition_input = BetValidationBatchProcess().process(
+            fixed_partition_input = _validate_source(
                 input_path,
                 tmp_path / "fixed-validation",
-                ValidationBatchSettings(
-                    feature_partition_count=7,
-                    target_feature_partition_rows=2,
-                ),
+                ValidationSourceConfig(feature_partition_count=7, target_feature_partition_rows=2),
             )
             self.assertEqual(fixed_partition_input.feature_partition_count, 7)
             self.assertEqual(len(fixed_partition_input.partition_paths), 7)
 
             with self.assertRaises(ValueError):
-                BetValidationBatchProcess().process(
+                _validate_source(
                     input_path,
                     tmp_path / "bad-validation",
-                    ValidationBatchSettings(target_feature_partition_rows=0),
+                    ValidationSourceConfig(target_feature_partition_rows=0),
                 )
 
     def test_validate_batch_writes_validation_outputs(self) -> None:
@@ -75,10 +112,10 @@ class BatchWorkflowTests(unittest.TestCase):
             write_csv(input_path, [_row("1", "1")], EXPECTED_COLUMNS)
 
             run = RunArtifactPublisher(output_dir, run_id="validation-batch-test")
-            partitioned_input = BetValidationBatchProcess().process(
+            partitioned_input = _validate_source(
                 input_path,
                 run.validation_dir,
-                ValidationBatchSettings(generated_at=run.validation_generated_at),
+                ValidationSourceConfig(raw_dir=run.raw_dir, generated_at=run.validation_generated_at),
             )
             report = run.write_validation_report(partitioned_input)
             manifest = run.write_manifest(partitioned_input, report)
@@ -102,10 +139,10 @@ class BatchWorkflowTests(unittest.TestCase):
             input_path = tmp_path / "bets.csv"
             write_csv(input_path, rows, EXPECTED_COLUMNS)
 
-            partitioned_input = BetValidationBatchProcess().process(
+            partitioned_input = _validate_source(
                 input_path,
                 tmp_path / "validation",
-                ValidationBatchSettings(batch_size=1),
+                ValidationSourceConfig(batch_size=1),
             )
             invalid_rows = []
             for partition_path in partitioned_input.invalid_partition_paths:
@@ -132,10 +169,10 @@ class BatchWorkflowTests(unittest.TestCase):
             input_path = tmp_path / "bets.csv"
             write_csv(input_path, rows, EXPECTED_COLUMNS)
 
-            partitioned_input = BetValidationBatchProcess().process(
+            partitioned_input = _validate_source(
                 input_path,
                 tmp_path / "validation",
-                ValidationBatchSettings(batch_size=1),
+                ValidationSourceConfig(batch_size=1),
             )
             valid_rows = []
             invalid_rows = []
@@ -166,10 +203,10 @@ class BatchWorkflowTests(unittest.TestCase):
             input_path = tmp_path / "bets.csv"
             write_csv(input_path, rows, EXPECTED_COLUMNS)
 
-            partitioned_input = BetValidationBatchProcess().process(
+            partitioned_input = _validate_source(
                 input_path,
                 tmp_path / "validation",
-                ValidationBatchSettings(batch_size=1),
+                ValidationSourceConfig(batch_size=1),
             )
             invalid_rows = []
             for partition_path in partitioned_input.invalid_partition_paths:
@@ -190,17 +227,17 @@ class BatchWorkflowTests(unittest.TestCase):
             write_csv(input_path, [_row("1", "1"), _row("2", "2", amount="-1")], EXPECTED_COLUMNS)
 
             run = RunArtifactPublisher(output_dir, run_id="platform-test-run")
-            partitioned_input = BetValidationBatchProcess().process(
+            partitioned_input = _validate_source(
                 input_path,
                 run.validation_dir,
-                ValidationBatchSettings(
+                ValidationSourceConfig(
+                    raw_dir=run.raw_dir,
                     feature_partition_count=2,
-                    target_feature_partition_rows=1000,
                     generated_at=run.validation_generated_at,
                 ),
             )
             report = run.write_validation_report(partitioned_input)
-            feature_result = BetFeatureBatchProcess().process(
+            feature_result = BetFeaturePartitionBatchProcess().process(
                 partitioned_input,
                 run.features_dir,
                 run.feature_generated_at,
@@ -229,10 +266,11 @@ class BatchWorkflowTests(unittest.TestCase):
             write_csv(input_path, [_row("1", "1"), _row("2", "2", amount="-1")], EXPECTED_COLUMNS)
 
             validation_run = RunArtifactPublisher(output_dir, run_id="001")
-            partitioned_input = BetValidationBatchProcess().process(
+            partitioned_input = _validate_source(
                 input_path,
                 validation_run.validation_dir,
-                ValidationBatchSettings(
+                ValidationSourceConfig(
+                    raw_dir=validation_run.raw_dir,
                     feature_partition_count=2,
                     generated_at=validation_run.validation_generated_at,
                 ),
@@ -243,7 +281,7 @@ class BatchWorkflowTests(unittest.TestCase):
 
             checkpoint = ValidationCheckpointLoader(output_dir / "runs" / "001").load()
             feature_run = RunArtifactPublisher(output_dir, run_id="001-features")
-            feature_result = BetFeatureBatchProcess().process(
+            feature_result = BetFeaturePartitionBatchProcess().process(
                 checkpoint.partitioned_input,
                 feature_run.features_dir,
                 feature_run.feature_generated_at,
@@ -298,13 +336,13 @@ class BatchWorkflowTests(unittest.TestCase):
             write_csv(input_path, rows, EXPECTED_COLUMNS)
 
             run = RunArtifactPublisher(output_dir, run_id="partition-test-run")
-            partitioned_input = BetValidationBatchProcess().process(
+            partitioned_input = _validate_source(
                 input_path,
                 run.validation_dir,
-                ValidationBatchSettings(
+                ValidationSourceConfig(
+                    raw_dir=run.raw_dir,
                     batch_size=1,
                     feature_partition_count=3,
-                    target_feature_partition_rows=1000,
                     generated_at=run.validation_generated_at,
                 ),
             )
@@ -329,7 +367,7 @@ class BatchWorkflowTests(unittest.TestCase):
             self.assertEqual(customer_row_counts["00000000-0000-4000-8000-000000000001"], 2)
             self.assertEqual(customer_row_counts[customer_b], 2)
 
-            feature_result = BetFeatureBatchProcess().process(
+            feature_result = BetFeaturePartitionBatchProcess().process(
                 partitioned_input,
                 run.features_dir,
                 run.feature_generated_at,
@@ -358,10 +396,11 @@ class BatchWorkflowTests(unittest.TestCase):
             write_csv(input_path, rows, EXPECTED_COLUMNS)
 
             run = RunArtifactPublisher(output_dir, run_id="concurrent-validation-test")
-            partitioned_input = BetValidationBatchProcess().process(
+            partitioned_input = _validate_source(
                 input_path,
                 run.validation_dir,
-                ValidationBatchSettings(
+                ValidationSourceConfig(
+                    raw_dir=run.raw_dir,
                     batch_size=2,
                     validation_worker_count=3,
                     target_feature_partition_rows=3,
@@ -369,7 +408,7 @@ class BatchWorkflowTests(unittest.TestCase):
                 ),
             )
             report = run.write_validation_report(partitioned_input)
-            feature_result = BetFeatureBatchProcess().process(
+            feature_result = BetFeaturePartitionBatchProcess().process(
                 partitioned_input,
                 run.features_dir,
                 run.feature_generated_at,
@@ -397,17 +436,18 @@ class BatchWorkflowTests(unittest.TestCase):
             write_csv(input_path, rows, EXPECTED_COLUMNS)
 
             run = RunArtifactPublisher(output_dir, run_id="concurrent-feature-test")
-            partitioned_input = BetValidationBatchProcess().process(
+            partitioned_input = _validate_source(
                 input_path,
                 run.validation_dir,
-                ValidationBatchSettings(
+                ValidationSourceConfig(
+                    raw_dir=run.raw_dir,
                     batch_size=2,
                     feature_partition_count=4,
                     generated_at=run.validation_generated_at,
                 ),
             )
             report = run.write_validation_report(partitioned_input)
-            feature_result = BetFeatureBatchProcess().process(
+            feature_result = BetFeaturePartitionBatchProcess().process(
                 partitioned_input,
                 run.features_dir,
                 run.feature_generated_at,

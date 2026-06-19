@@ -23,6 +23,10 @@ ALLOWED_CATEGORIES = frozenset({"sports", "racing"})
 ALLOWED_STAKE_TYPES = frozenset({"cash", "bonus"})
 ALLOWED_BET_RESULTS = frozenset({"return", "no-return"})
 
+RAW_BETS_SCHEMA = pa.schema(
+    [(column, pa.string()) for column in EXPECTED_COLUMNS] + [("source_row_number", pa.int64())]
+)
+
 VALID_BETS_SCHEMA = pa.schema(
     [
         ("bet_id", pa.int64()),

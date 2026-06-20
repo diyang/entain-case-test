@@ -1,6 +1,234 @@
 # Entain Bet Pipeline
 
-Local, reproducible batch pipeline for validating betting records and producing customer-level features for downstream ML consumers.
+Local, reproducible batch pipeline for validating raw betting records and producing customer-level features for downstream ML consumers.
+
+## Pipeline Layers
+
+The batch run is organized into three local data layers:
+
+- **Bronze layer: Customer Completeness Partition** is a row-batch process that writes raw source rows to `raw/raw_bets/part-*.parquet`. Each `customer_id` is routed to one partition so later customer-level processing does not split a customer's history across workers.
+- **Silver layer: Validated Bets and Invalid-Bet Quarantine** is a concurrency-compatible partition batch process. It reads bronze partitions, applies validation, writes curated `validation/valid_bets/part-*.parquet`, and writes rejected rows to `validation/invalid_bets/part-*.parquet`.
+- **Gold layer: Customer Feature Dataset** is a concurrency-compatible partition batch process. It reads silver valid-bets partitions and writes customer-level ML features to `features/customer_features/part-*.parquet`.
+
+Runs use ACID-style local publish: artifacts are written under `outputs/_staging/<run_id>/`, checked for completeness, marked with `_SUCCESS`, and then published to `outputs/runs/<run_id>/`. Consumers should only read committed runs with `_SUCCESS`.
+
+For large data, `build-features --from-validation-run outputs/runs/<validation_run_id>` reuses a committed silver-layer validation checkpoint, skips raw CSV validation, writes a new gold-layer feature run, and records `source_validation_run_id` for lineage.
+
+## Docker Quick Start
+
+The Docker image installs dependencies with `uv sync --frozen` from `uv.lock`, so container builds use locked dependency versions instead of resolving open ranges from `pyproject.toml`.
+
+Build:
+
+```bash
+docker build -t entain-bet-pipeline .
+```
+
+Validate raw bets:
+
+```bash
+docker run --rm \
+  -v $(pwd)/data:/data \
+  -v $(pwd)/outputs:/outputs \
+  entain-bet-pipeline validate --input /data/bets.csv --output /outputs/
+```
+
+Validate and build features:
+
+```bash
+docker run --rm \
+  -v $(pwd)/data:/data \
+  -v $(pwd)/outputs:/outputs \
+  entain-bet-pipeline build-features --input /data/bets.csv --output /outputs/
+```
+
+Build features from an existing validation checkpoint:
+
+```bash
+docker run --rm \
+  -v $(pwd)/data:/data:ro \
+  -v $(pwd)/outputs:/outputs \
+  entain-bet-pipeline validate \
+  --input /data/bets.csv \
+  --output /outputs \
+  --run-id 001
+
+docker run --rm \
+  -v $(pwd)/outputs:/outputs \
+  entain-bet-pipeline build-features \
+  --from-validation-run /outputs/runs/001 \
+  --output /outputs \
+  --run-id 001-features
+```
+
+The second command skips raw CSV validation, reads `/outputs/runs/001/validation/valid_bets/part-*.parquet`, writes a new feature run at `/outputs/runs/001-features`, and leaves the committed validation run unchanged.
+
+Optional Docker flags:
+
+| Option | Purpose |
+| --- | --- |
+| `--batch-size` | Raw CSV rows read per bronze row batch. |
+| `--validation-workers` | Concurrent silver partition validation workers. |
+| `--feature-workers` | Concurrent gold feature partition workers. |
+| `--target-feature-partition-rows` | Approximate source rows per customer-complete feature partition. |
+| `--feature-partition-count` | Exact number of customer-hash partitions; overrides target rows. |
+| `--first-n-bets` | Feature window size by authoritative `bet_num`; defaults to 20. |
+
+## Optional Local Development
+
+Install:
+
+```bash
+uv sync
+```
+
+Run the same workflows locally:
+
+```bash
+uv run bet-pipeline validate --input data/bets.csv --output outputs/ --run-id local-validation
+
+uv run bet-pipeline build-features --input data/bets.csv --output outputs/ --run-id local-features
+
+uv run bet-pipeline build-features \
+  --from-validation-run outputs/runs/local-validation \
+  --output outputs/ \
+  --run-id local-validation-features
+```
+
+The pipeline writes batch outputs as parquet with explicit schemas. Reports and run manifests are JSON.
+
+## Outputs
+
+Bronze raw partitioning writes:
+
+```text
+outputs/runs/<run_id>/raw/raw_bets/part-00000.parquet
+```
+
+Validation writes:
+
+```text
+outputs/runs/<run_id>/validation/valid_bets/part-00000.parquet
+outputs/runs/<run_id>/validation/invalid_bets/part-00000.parquet
+outputs/runs/<run_id>/validation/validation_report.json
+```
+
+Feature generation writes:
+
+```text
+outputs/runs/<run_id>/features/customer_features/part-00000.parquet
+outputs/runs/<run_id>/features/feature_report.json
+```
+
+Full batch runs also write:
+
+```text
+outputs/runs/<run_id>/run_manifest.json
+outputs/runs/<run_id>/_SUCCESS
+```
+
+`raw_bets/`, `valid_bets/`, `invalid_bets/`, and `customer_features/` are each one logical parquet dataset made from partition parquet files such as `part-00000.parquet` and `part-00001.parquet`. This lets partition processing scale without sharing one large writer.
+
+The current committed sample run under `outputs/runs/run-2026-06-20T10-16-04Z/` contains eight partition files for each parquet dataset:
+
+```text
+raw/raw_bets/part-00000.parquet ... part-00007.parquet
+validation/valid_bets/part-00000.parquet ... part-00007.parquet
+validation/invalid_bets/part-00000.parquet ... part-00007.parquet
+features/customer_features/part-00000.parquet ... part-00007.parquet
+```
+
+That run processed `372296` rows from `/data/bets.csv`: `371432` valid rows, `864` invalid rows, and `5000` customer feature rows. The validation report records failure counts by rule:
+
+```text
+betting_amount_gt_0: 835
+return_for_entain_formula: 29
+price_gt_1: 5
+payout_formula: 3
+```
+
+The feature report records `customers_with_incomplete_first_n: 206`, `first_n_bets: 20`, `feature_partition_count: 8`, and `window_datetime_column: bet_20_datetime`.
+
+## Validation Rules
+
+The silver validation stage checks required columns, integer `bet_id`, UUID `customer_id`, parseable `bet_datetime`, positive `bet_num`, numeric parsing, business domains, `betting_amount`, `price`, `payout`, and `return_for_entain`.
+
+It also checks the payout and `return_for_entain` formulas:
+
+- `betting_amount > 0`
+- `price > 1`
+- `category in {"sports", "racing"}`
+- `stake_type in {"cash", "bonus"}`
+- `bet_result in {"return", "no-return"}`
+- payout by `bet_result` and `stake_type`
+- `return_for_entain` by `bet_result` and `stake_type`
+
+Customer ordering is validated after bronze customer-complete partitioning. Duplicate `bet_id`, duplicate `(customer_id, bet_num)`, and raw `bet_num` sequence gaps are quarantined into `invalid_bets`. Invalid rows keep `source_row_number`, `validation_errors`, and `validated_at`; failure counts are written to `validation_report.json`.
+
+## Customer Feature Dataset
+
+The feature output has one row per `customer_id`. It is built from validated rows only, using each customer's first N bets by authoritative `bet_num`; the default N is 20.
+
+| Feature | Aggregation | Why it is useful |
+| --- | --- | --- |
+| `first_bet_datetime` | Timestamp from the lowest valid `bet_num` in the first-N window | Supports cohorting and time-based joins. |
+| `bet_<N>_datetime` | Timestamp where `bet_num == first_n_bets`, when present | Shows whether the customer reached the configured first-N window. |
+| `bets_used` | Count of valid bets used in the first-N window | Makes missing or invalid first-N records visible. |
+| `total_betting_amount` | Sum of `betting_amount` | Captures early stake volume. |
+| `mean_betting_amount` | Average `betting_amount` | Captures typical stake size. |
+| `mean_price` | Average decimal odds `price` | Summarizes early odds profile. |
+| `pct_racing` | Share of first-N bets where `category == racing` | Encodes product preference. |
+| `pct_cash` | Share of first-N bets where `stake_type == cash` | Distinguishes cash-funded and bonus-funded behavior. |
+| `pct_return` | Share of first-N bets where `bet_result == return` | Captures early return frequency. |
+| `total_payout` | Sum of validated `payout` | Captures customer payout outcome. |
+| `total_return_for_entain` | Sum of `return_for_entain` | Captures early customer profitability from Entain's perspective. |
+| `feature_generated_at` | Batch feature generation timestamp | Provides feature lineage. |
+
+Sums capture total exposure and value, means normalize behavior across customers with different valid-row counts, and percentages convert categorical behavior into numeric model features.
+
+## First-N Feature Policy
+
+If invalid records appear inside a customer's configured first-N window:
+
+1. Invalid records are written to `invalid_bets` with validation errors.
+2. Feature generation uses only valid rows where `bet_num <= first_n_bets`.
+3. Later valid bets are not pulled forward to replace invalid records.
+4. `bets_used` can be less than `first_n_bets`.
+5. The window datetime column is only populated when the valid `bet_num == first_n_bets` row exists.
+6. The dynamic datetime column follows the configured window: `--first-n-bets 20` writes `bet_20_datetime`; `--first-n-bets 10` writes `bet_10_datetime`.
+7. `feature_report.json` and `run_manifest.json` include `customers_with_incomplete_first_n`.
+
+This keeps the feature window deterministic and avoids interpolating financial outcomes.
+
+## Tests
+
+Lint and formatting:
+
+```bash
+uv run ruff format --check src tests
+uv run ruff check src tests
+```
+
+Unit tests:
+
+```bash
+uv run python -m unittest discover tests/unit
+```
+
+Coverage:
+
+```bash
+uv run python -m coverage run -m unittest discover tests/unit
+uv run python -m coverage report -m
+```
+
+Docker integration test:
+
+```bash
+uv run pytest tests/integrate -v
+```
+
+The integration test uses `tests/integrate/fixtures/bets.csv`, not the full `data/bets.csv`, so it runs quickly in CI while still exercising Docker build, validation, feature generation, ACID-style publish, and artifact checks.
 
 ## Project Layout
 
@@ -29,222 +257,3 @@ docs/
   architecture.md
   design_note.md
 ```
-
-## Install
-
-```bash
-uv sync
-```
-
-The pipeline writes batch outputs as parquet with explicit schemas. Reports and run manifests are JSON.
-
-## Run
-
-Recommended single-command feature batch:
-
-```bash
-uv run bet-pipeline build-features --input data/bets.csv --output outputs/ --run-id local-001
-```
-
-This writes validation outputs, feature outputs, and run lineage under `outputs/runs/local-001/`.
-
-You can set the internal row batch size:
-
-```bash
-uv run bet-pipeline build-features --input data/bets.csv --output outputs/ --run-id local-001 --batch-size 1000
-```
-
-Local execution defaults to one validation worker. You can enable concurrent customer-complete partition validation:
-
-```bash
-uv run bet-pipeline build-features --input data/bets.csv --output outputs/ --run-id local-001 --validation-workers 4
-```
-
-Local execution also defaults to one feature worker. You can enable concurrent customer-complete feature partition processing:
-
-```bash
-uv run bet-pipeline build-features --input data/bets.csv --output outputs/ --run-id local-001 --feature-workers 4
-```
-
-You can also set the exact number of customer-hash feature partitions:
-
-```bash
-uv run bet-pipeline build-features --input data/bets.csv --output outputs/ --run-id local-001 --feature-partition-count 8
-```
-
-Or let the validation pass create customer-complete feature partitions from an approximate target rows-per-feature-partition:
-
-```bash
-uv run bet-pipeline build-features --input data/bets.csv --output outputs/ --run-id local-001 --target-feature-partition-rows 1000
-```
-
-Validate raw bets only:
-
-```bash
-uv run bet-pipeline validate --input data/bets.csv --output outputs/ --run-id local-001
-```
-
-Build features from an existing committed validation run without revalidating the raw CSV:
-
-```bash
-uv run bet-pipeline build-features \
-  --from-validation-run outputs/runs/local-001 \
-  --output outputs/ \
-  --run-id local-001-features
-```
-
-Feature engineering is a batch phase inside the public `build-features` command. `RunArtifactPublisher` owns staging, reports, manifest, and commit. The raw partition process streams CSV row batches into customer-complete parquet partitions. `BetValidationPartitionBatchProcess` validates those raw partitions and writes valid and invalid parquet partitions. For feature runs, `BetFeaturePartitionBatchProcess` iterates valid-bets partitions and creates a `BetFeaturePartitionWorker` for each partition to build and write features.
-
-For large data, `build-features --from-validation-run outputs/runs/<validation_run_id>` skips raw CSV validation and reuses the committed `validation/valid_bets/part-*.parquet` checkpoint. The checkpoint must have `_SUCCESS`, its validation schema version must match the current code, and the new feature run records `source_validation_run_id` in its manifest. The committed validation run is never mutated.
-
-`--batch-size` controls how many source rows are read and routed at a time during raw partitioning. It is not a feature boundary. `--validation-workers` defaults to 1 and can be increased for concurrent customer-complete raw partition validation. `--feature-workers` defaults to 1 and can be increased for concurrent customer-complete feature partition processing; each worker writes a distinct `customer_features/part-*.parquet` file. `--target-feature-partition-rows` is the main sizing input for feature partitions and defaults to the same row-count constant as `--batch-size` (`DEFAULT_BATCH_ROWS = 1000`), so raw row batches and feature partitions are roughly aligned by default. If you change `--batch-size` and want feature partitions to track it, set `--target-feature-partition-rows` to the same value. `--feature-partition-count` controls the exact number of customer-hash feature partitions and overrides the dynamic target. All rows for the same `customer_id` go to the same partition, so customer features are not split across row batches. `--first-n-bets` controls the feature window size and defaults to 20 for the interview task.
-
-## Outputs
-
-Validation writes:
-
-```text
-outputs/runs/<run_id>/validation/valid_bets/part-00000.parquet
-outputs/runs/<run_id>/validation/invalid_bets/part-00000.parquet
-outputs/runs/<run_id>/validation/validation_report.json
-```
-
-Feature generation writes:
-
-```text
-outputs/runs/<run_id>/features/customer_features/part-00000.parquet
-outputs/runs/<run_id>/features/feature_report.json
-```
-
-Full batch runs also write:
-
-```text
-outputs/runs/<run_id>/run_manifest.json
-outputs/runs/<run_id>/_SUCCESS
-```
-
-The pipeline writes all run artifacts to `outputs/_staging/<run_id>/` first. `valid_bets/`, `invalid_bets/`, and `customer_features/` are each one logical parquet dataset made from partition parquet files such as `part-00000.parquet` and `part-00001.parquet`. That lets partition processing scale without sharing one large writer. The run commits by validating expected partition files, writing `_SUCCESS`, and atomically publishing the staged directory to `outputs/runs/<run_id>/`. Consumers should only read runs with `_SUCCESS`.
-
-## Tests
-
-Lint and formatting checks:
-
-```bash
-uv run ruff format --check src tests
-uv run ruff check src tests
-```
-
-Unit tests:
-
-```bash
-uv run python -m unittest discover tests/unit
-```
-
-Coverage:
-
-```bash
-uv run python -m coverage run -m unittest discover tests/unit
-uv run python -m coverage report -m
-```
-
-Docker integration test:
-
-```bash
-uv run pytest tests/integrate -v
-```
-
-The integration test uses `tests/integrate/fixtures/bets.csv`, not the full `data/bets.csv`, so it can run quickly in CI while still exercising Docker build, validation, feature generation, ACID-style publish, and artifact checks.
-
-## Docker
-
-The Docker image installs dependencies with `uv sync --frozen` from `uv.lock`, so container builds use the locked dependency versions instead of resolving open ranges from `pyproject.toml`.
-
-Build:
-
-```bash
-docker build -t entain-bet-pipeline .
-```
-
-Validate only:
-
-```bash
-docker run --rm \
-  -v $(pwd)/data:/data \
-  -v $(pwd)/outputs:/outputs \
-  entain-bet-pipeline validate --input /data/bets.csv --output /outputs/
-```
-
-Feature batch:
-
-```bash
-docker run --rm \
-  -v $(pwd)/data:/data \
-  -v $(pwd)/outputs:/outputs \
-  entain-bet-pipeline build-features --input /data/bets.csv --output /outputs/
-```
-
-Feature batch from an existing validation checkpoint:
-
-```bash
-docker run --rm \
-  -v $(pwd)/data:/data:ro \
-  -v $(pwd)/outputs:/outputs \
-  entain-bet-pipeline validate \
-  --input /data/bets.csv \
-  --output /outputs \
-  --run-id 001
-
-docker run --rm \
-  -v $(pwd)/outputs:/outputs \
-  entain-bet-pipeline build-features \
-  --from-validation-run /outputs/runs/001 \
-  --output /outputs \
-  --run-id 001-features
-```
-
-The second Docker command skips raw CSV validation and reads `/outputs/runs/001/validation/valid_bets/part-*.parquet`. It writes a new feature run at `/outputs/runs/001-features`, records `source_validation_run_id: 001`, and leaves the committed validation run unchanged.
-
-## Validation Rules
-
-The batch validation job checks required columns, integer `bet_id`, UUID `customer_id`, parseable `bet_datetime`, positive `bet_num`, numeric parsing, business domains, `betting_amount`, `price`, `payout`, and `return_for_entain`.
-
-It also checks the required payout and `return_for_entain` formulas. While validation streams through row batches, it keeps a small uniqueness index so later duplicate `bet_id` values and later duplicate `(customer_id, bet_num)` values are quarantined instead of entering `valid_bets`. After customer-complete partition files are written, the validation stage runs a partition-level sequence finalizer. If the raw observed bet numbers for a customer have a gap, such as `1, 2, 4`, all valid rows for that affected customer are demoted into `invalid_bets` with `customer_bet_num_sequence`. The finalizer reads one customer-complete partition at a time, so it enforces the sequence rule without loading the full CSV into memory.
-
-Invalid rows are written to parquet quarantine with `source_row_number`, `validation_errors`, and `validated_at`. Failure counts are also written to `validation_report.json`.
-
-## Customer Feature Dataset
-
-The feature output has one row per `customer_id`. It is built from validated rows only, using each customer's first N bets by authoritative `bet_num`; the default N is 20.
-
-The selected features summarize early customer betting behavior:
-
-| Feature | Aggregation | Why it is useful |
-| --- | --- | --- |
-| `first_bet_datetime` | Timestamp from the lowest valid `bet_num` in the first-N window | Gives the start of the observed customer history and supports time-based joins or cohorting. |
-| `bet_<N>_datetime` | Timestamp where `bet_num == first_n_bets`, when present | Shows whether the customer reached the configured first-N window. With the default `--first-n-bets 20`, this is `bet_20_datetime`; with `--first-n-bets 10`, this is `bet_10_datetime`. |
-| `bets_used` | Count of valid bets used in the first-N window | Makes missing or invalid first-N records visible to downstream models. |
-| `total_betting_amount` | Sum of `betting_amount` | Captures early customer stake volume. |
-| `mean_betting_amount` | Average `betting_amount` | Captures typical stake size without letting customers with more available valid rows dominate only through volume. |
-| `mean_price` | Average decimal odds `price` | Summarizes early risk appetite or bet profile. |
-| `pct_racing` | Share of first-N bets where `category == racing` | Encodes product preference between racing and sports. |
-| `pct_cash` | Share of first-N bets where `stake_type == cash` | Distinguishes real-cash funded behavior from bonus-funded behavior. |
-| `pct_return` | Share of first-N bets where `bet_result == return` | Captures early win/return frequency. |
-| `total_payout` | Sum of validated `payout` | Captures customer cash-back outcome over the early window. |
-| `total_return_for_entain` | Sum of `return_for_entain` | Captures early customer profitability from Entain's perspective. |
-| `feature_generated_at` | Batch feature generation timestamp | Provides feature lineage and supports reproducibility checks. |
-
-These are deliberately simple, auditable aggregations. Sums capture total exposure and value, means normalize behavior across customers with different valid row counts, and percentages convert categorical behavior into stable numeric features that batch training, scoring, BI, CRM, or decisioning systems can consume.
-
-## First-N Feature Policy
-
-The pipeline treats `bet_num` as the authoritative order. The default feature window is the first 20 bets, and it can be changed with `--first-n-bets`. If invalid records appear inside a customer's configured first-N window, the batch handles them as follows:
-
-1. The invalid records are written to the `invalid_bets` parquet partition with validation errors.
-2. Feature generation continues for that customer using the remaining valid records where `bet_num <= first_n_bets`.
-3. Later valid bets, such as `bet_num == first_n_bets + 1`, are not pulled forward to replace invalid records inside the feature window.
-4. The feature row shows the effect through `bets_used`; it can be less than `first_n_bets`.
-5. The window datetime column is only populated when the valid `bet_num == first_n_bets` row exists.
-6. The window datetime column name follows the configured window: default `--first-n-bets 20` writes `bet_20_datetime`; `--first-n-bets 10` writes `bet_10_datetime`.
-7. `feature_report.json` and `run_manifest.json` include `customers_with_incomplete_first_n` so operators can see how often this happened.
-
-This keeps the feature window deterministic for the same source data and avoids silently changing the definition of the first-N window.

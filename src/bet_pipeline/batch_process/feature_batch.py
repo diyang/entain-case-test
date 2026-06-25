@@ -40,9 +40,13 @@ class BetFeaturePartitionWorker:
         feature_builder: BetFeatureBuilder | None = None,
     ) -> None:
         self.config = config
-        self.feature_builder = (
-            BetFeatureBuilder(first_n_bets=config.first_n_bets) if feature_builder is None else feature_builder
-        )
+        if feature_builder is None:
+            self.feature_builder = BetFeatureBuilder(first_n_bets=config.first_n_bets)
+            return
+        if feature_builder.first_n_bets != config.first_n_bets:
+            self.feature_builder = BetFeatureBuilder(first_n_bets=config.first_n_bets)
+            return
+        self.feature_builder = feature_builder
 
     def process(self) -> FeatureBatchResult:
         _, valid_rows = read_parquet(self.config.partition_path)

@@ -3,10 +3,15 @@ from __future__ import annotations
 import json
 import unittest
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from bet_pipeline.batch_process.feature_batch import BetFeaturePartitionBatchProcess
+from bet_pipeline.batch_process.feature_batch import (
+    BetFeaturePartitionBatchProcess,
+    BetFeaturePartitionWorker,
+    FeaturePartitionConfig,
+)
 from bet_pipeline.batch_process.raw_partition_batch import (
     CustomerCompletePartitionSettings,
     RawBetCustomerCompletePartitionBatchProcess,
@@ -222,6 +227,22 @@ class FeatureTests(unittest.TestCase):
             self.assertEqual(features[0]["bets_used"], 10)
             self.assertEqual(features[0]["total_betting_amount"], 100.0)
             self.assertEqual(features[0]["bet_10_datetime"].isoformat(), "2024-08-10T00:00:00")
+
+    def test_feature_partition_worker_uses_config_window_over_injected_builder(self) -> None:
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config = FeaturePartitionConfig(
+                partition_index=0,
+                partition_path=tmp_path / "valid_bets.parquet",
+                features_dir=tmp_path / "features",
+                feature_generated_at=datetime(2024, 1, 1),
+                first_n_bets=10,
+            )
+
+            worker = BetFeaturePartitionWorker(config, BetFeatureBuilder(first_n_bets=20))
+
+            self.assertEqual(worker.feature_builder.first_n_bets, 10)
+            self.assertEqual(worker.feature_builder.window_datetime_column, "bet_10_datetime")
 
     def test_file_processor_excludes_invalid_rows_before_feature_building(self) -> None:
         rows = [_row(1, "10"), _row(2, "-5")]

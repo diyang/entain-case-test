@@ -393,6 +393,32 @@ class MainTests(unittest.TestCase):
             run.write_manifest.assert_called_once_with(partitioned_input, report, feature_result)
             run.commit.assert_called_once_with(partitioned_input)
 
+    def test_build_features_rejects_input_and_checkpoint_before_staging(self) -> None:
+        with patch("bet_pipeline.main.RunArtifactPublisher") as run_class:
+            with self.assertRaises(SystemExit) as raised:
+                main.main(
+                    [
+                        "build-features",
+                        "--input",
+                        "data/bets.csv",
+                        "--from-validation-run",
+                        "outputs/runs/001",
+                        "--output",
+                        "outputs",
+                    ]
+                )
+
+            self.assertEqual(raised.exception.code, 2)
+            run_class.assert_not_called()
+
+    def test_build_features_requires_input_or_checkpoint_before_staging(self) -> None:
+        with patch("bet_pipeline.main.RunArtifactPublisher") as run_class:
+            with self.assertRaises(SystemExit) as raised:
+                main.main(["build-features", "--output", "outputs"])
+
+            self.assertEqual(raised.exception.code, 2)
+            run_class.assert_not_called()
+
     def test_validate_normalizes_validation_output_to_batch_root(self) -> None:
         with (
             patch("bet_pipeline.main.RunArtifactPublisher") as run_class,

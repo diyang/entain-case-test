@@ -200,6 +200,14 @@ If invalid records appear inside a customer's configured first-N window:
 
 This keeps the feature window deterministic and avoids interpolating financial outcomes.
 
+## AI-Assisted Production Engineering
+
+AI was used as an engineering assistant to accelerate implementation while keeping production requirements explicit and testable. The author owned the architecture, class boundaries, functional behavior, and core design decisions: concurrency-compatible batch processing, customer-complete partitioning, bronze/silver/gold data layers, validation checkpoint reuse, deterministic first-N feature generation, Docker reproducibility, GitHub Actions CI, and ACID-style local publish through `_staging`, completeness checks, `_SUCCESS`, and committed `runs/<run_id>` outputs.
+
+AI usage was limited to implementation support: drafting code from the author's design, generating small test cases, checking for edge cases, improving wording in documentation, and suggesting cleanup during review. The author reviewed, corrected, and accepted changes against the production requirements before they were kept.
+
+All AI-assisted changes were validated through local linting, unit tests, Docker integration tests, and documented operating commands. The resulting pipeline does not depend on AI at runtime; it depends on explicit contracts, versioned artifacts, reproducible Docker builds, and test-covered behavior.
+
 ## Tests
 
 Lint and formatting:

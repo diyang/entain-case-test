@@ -198,19 +198,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.command == "build-features":
+        if args.from_validation_run is not None and args.input is not None:
+            parser.error("build-features accepts either --input or --from-validation-run, not both")
+        if args.from_validation_run is None and args.input is None:
+            parser.error("build-features requires either --input or --from-validation-run")
+
     if args.command in {"validate", "build-features"}:
         artifact_publisher = RunArtifactPublisher(batch_output_root(args.command, args.output), args.run_id)
         try:
             if args.command == "build-features" and args.from_validation_run is not None:
-                if args.input is not None:
-                    parser.error("build-features accepts either --input or --from-validation-run, not both")
                 checkpoint = ValidationCheckpointLoader(args.from_validation_run).load()
                 partitioned_input = checkpoint.partitioned_input
                 report = checkpoint.validation_report
             else:
-                if args.command == "build-features" and args.input is None:
-                    parser.error("build-features requires either --input or --from-validation-run")
-
                 # Bronze layer: stream raw CSV into customer-complete raw parquet partitions.
                 raw_partition_process = RawBetCustomerCompletePartitionBatchProcess()
                 raw_partitioned_input = raw_partition_process.process(
